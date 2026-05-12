@@ -1,0 +1,2 @@
+kaggle-environments==1.18.0
+numpy<2
