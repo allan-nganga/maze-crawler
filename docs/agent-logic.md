@@ -15,6 +15,7 @@ State resets when `obs.step` does not increase (a new game).
 ## Shared helpers
 
 - **Walls:** `obs.walls` index is `(row - southBound) * width + col`. Bits N=1, E=2, S=4, W=8.
+- **Known-wall BFS:** goal pathing uses BFS over discovered cells (`obs.walls != -1`) instead of greedy axis steps, so units route around known wall mazes with fewer wasted moves.
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
 - **Crystal claims:** When a unit commits to a scored crystal, that crystal key is added to `planned_crystal_claims` so another friendly does not chase the same snack.
 
@@ -66,7 +67,8 @@ The factory does not hunt crystals or refuel.
 **Exploration** when not refueling:
 
 - If only one direction is open, take it (reverse out of a dead end).
-- Prefer north; avoid the previous cell and cells already claimed by another friendly this turn.
+- Scouts run a frontier search: BFS to the nearest known cell adjacent to unknown space, then push into that opening.
+- If no frontier path exists, prefer north and avoid the previous cell and cells already claimed by another friendly this turn.
 
 ## Worker (type 2)
 

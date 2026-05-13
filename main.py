@@ -1,3 +1,4 @@
+from collections import deque
 from random import choice
 
 remembered_mining_nodes = set()
@@ -6,6 +7,19 @@ scout_prev_cell = {}
 last_seen_step = -1
 
 CRYSTAL_MEMORY_TURNS = 6
+DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
+DIRECTION_DELTAS = {
+    "NORTH": (0, 1),
+    "SOUTH": (0, -1),
+    "EAST": (1, 0),
+    "WEST": (-1, 0),
+}
+DIRECTION_WALL_BITS = {
+    "NORTH": 1,
+    "EAST": 2,
+    "SOUTH": 4,
+    "WEST": 8,
+}
 CRUSHES = {
     (0, 3),
     (0, 2),
@@ -55,7 +69,154 @@ def crush_outcome(attacker_type, defender_type):
     return "both"
 
 
-def step_toward(col, row, target_col, target_row, can_go):
+def in_bounds(col, row, obs, config):
+    return 0 <= col < config.width and obs.southBound <= row <= obs.northBound
+
+
+def wall_value(col, row, obs, config):
+    if not in_bounds(col, row, obs, config):
+        return None
+    idx = (row - obs.southBound) * config.width + col
+    if idx < 0 or idx >= len(obs.walls):
+        return None
+    return obs.walls[idx]
+
+
+def next_cell(col, row, direction):
+    dcol, drow = DIRECTION_DELTAS[direction]
+    return col + dcol, row + drow
+
+
+def can_move_known(col, row, direction, obs, config):
+    target_col, target_row = next_cell(col, row, direction)
+    if not in_bounds(target_col, target_row, obs, config):
+        return False
+
+    w = wall_value(col, row, obs, config)
+    if w is None or w == -1:
+        return False
+
+    if w & DIRECTION_WALL_BITS[direction]:
+        return False
+
+    target_w = wall_value(target_col, target_row, obs, config)
+    if target_w is None or target_w == -1:
+        return False
+    return True
+
+
+def is_frontier_cell(col, row, obs, config):
+    w = wall_value(col, row, obs, config)
+    if w is None or w == -1:
+        return False
+
+    for direction in DIR_ORDER:
+        if w & DIRECTION_WALL_BITS[direction]:
+            continue
+        next_col, next_row = next_cell(col, row, direction)
+        if not in_bounds(next_col, next_row, obs, config):
+            continue
+        if wall_value(next_col, next_row, obs, config) == -1:
+            return True
+    return False
+
+
+def frontier_opening_action(col, row, can_go, obs, config, planned_targets, prev_key):
+    options = []
+    for direction in DIR_ORDER:
+        if not can_go[direction]:
+            continue
+        next_col, next_row = next_cell(col, row, direction)
+        if not in_bounds(next_col, next_row, obs, config):
+            continue
+        next_key = f"{next_col},{next_row}"
+        if wall_value(next_col, next_row, obs, config) != -1:
+            continue
+        if next_key in planned_targets:
+            continue
+        if prev_key is not None and next_key == prev_key:
+            continue
+        options.append(direction)
+
+    if "NORTH" in options:
+        return "NORTH"
+    return choice(options) if options else None
+
+
+def bfs_first_step_to_target(start_col, start_row, goal_col, goal_row, obs, config):
+    if (start_col, start_row) == (goal_col, goal_row):
+        return "IDLE"
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return None
+    if wall_value(goal_col, goal_row, obs, config) in (None, -1):
+        return None
+
+    start = (start_col, start_row)
+    queue = deque([start])
+    visited = {start}
+    first_step = {}
+
+    while queue:
+        col, row = queue.popleft()
+        for direction in DIR_ORDER:
+            if not can_move_known(col, row, direction, obs, config):
+                continue
+            next_col, next_row = next_cell(col, row, direction)
+            state = (next_col, next_row)
+            if state in visited:
+                continue
+            visited.add(state)
+            first_step[state] = direction if (col, row) == start else first_step[(col, row)]
+            if state == (goal_col, goal_row):
+                return first_step[state]
+            queue.append(state)
+
+    return None
+
+
+def bfs_first_step_to_frontier(start_col, start_row, can_go, obs, config, planned_targets, prev_key):
+    start = (start_col, start_row)
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return None
+
+    queue = deque([start])
+    visited = {start}
+    first_step = {}
+
+    while queue:
+        col, row = queue.popleft()
+        if is_frontier_cell(col, row, obs, config):
+            if (col, row) == start:
+                action = frontier_opening_action(
+                    col, row, can_go, obs, config, planned_targets, prev_key
+                )
+                if action is not None:
+                    return action
+            else:
+                return first_step[(col, row)]
+
+        for direction in DIR_ORDER:
+            if not can_move_known(col, row, direction, obs, config):
+                continue
+            next_col, next_row = next_cell(col, row, direction)
+            next_key = f"{next_col},{next_row}"
+            if (col, row) == start and next_key in planned_targets:
+                continue
+            state = (next_col, next_row)
+            if state in visited:
+                continue
+            visited.add(state)
+            first_step[state] = direction if (col, row) == start else first_step[(col, row)]
+            queue.append(state)
+
+    return None
+
+
+def step_toward(col, row, target_col, target_row, can_go, obs, config):
+    action = bfs_first_step_to_target(col, row, target_col, target_row, obs, config)
+    if action is not None:
+        return action
+
     if target_row > row and can_go["NORTH"]:
         return "NORTH"
     if target_row < row and can_go["SOUTH"]:
@@ -64,18 +225,12 @@ def step_toward(col, row, target_col, target_row, can_go):
         return "EAST"
     if target_col < col and can_go["WEST"]:
         return "WEST"
-    fallback = [d for d in ["NORTH", "EAST", "WEST", "SOUTH"] if can_go[d]]
+    fallback = [d for d in DIR_ORDER if can_go[d]]
     return choice(fallback) if fallback else "IDLE"
 
 
 def target_cell(col, row, action):
-    deltas = {
-        "NORTH": (0, 1),
-        "SOUTH": (0, -1),
-        "EAST": (1, 0),
-        "WEST": (-1, 0),
-    }
-    dcol, drow = deltas.get(action, (0, 0))
+    dcol, drow = DIRECTION_DELTAS.get(action, (0, 0))
     return f"{col + dcol},{row + drow}"
 
 
@@ -105,7 +260,7 @@ def choose_factory_build(energy, config, counts, remembered_nodes):
 
 
 def pick_move(col, row, can_go, planned_targets, prefer_north=True):
-    options = [d for d in ["NORTH", "EAST", "WEST", "SOUTH"] if can_go[d]]
+    options = [d for d in DIR_ORDER if can_go[d]]
     if not options:
         return "IDLE"
 
@@ -126,8 +281,18 @@ def energy_is_low(rtype, energy, config):
     return False
 
 
-def move_toward_goal(col, row, can_go, planned_targets, goal_col, goal_row, prefer_north=True):
-    action = step_toward(col, row, goal_col, goal_row, can_go)
+def move_toward_goal(
+    col,
+    row,
+    can_go,
+    planned_targets,
+    goal_col,
+    goal_row,
+    obs,
+    config,
+    prefer_north=True,
+):
+    action = step_toward(col, row, goal_col, goal_row, can_go, obs, config)
     if action == "IDLE":
         return "IDLE"
     if target_cell(col, row, action) in planned_targets:
@@ -286,6 +451,8 @@ def fuel_action(
                 planned_targets,
                 target_col,
                 target_row,
+                obs,
+                config,
                 prefer_north=False,
             ),
             crystal_key,
@@ -307,6 +474,8 @@ def fuel_action(
                     planned_targets,
                     target_col,
                     target_row,
+                    obs,
+                    config,
                     prefer_north=False,
                 ),
                 None,
@@ -315,8 +484,8 @@ def fuel_action(
     return None, None
 
 
-def scout_explore_action(col, row, can_go, planned_targets, uid):
-    options = [d for d in ["NORTH", "EAST", "WEST", "SOUTH"] if can_go[d]]
+def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
+    options = [d for d in DIR_ORDER if can_go[d]]
     if not options:
         return "IDLE"
 
@@ -324,6 +493,15 @@ def scout_explore_action(col, row, can_go, planned_targets, uid):
         return options[0]
 
     prev_key = scout_prev_cell.get(uid)
+    frontier_action = bfs_first_step_to_frontier(
+        col, row, can_go, obs, config, planned_targets, prev_key
+    )
+    if (
+        frontier_action is not None
+        and target_cell(col, row, frontier_action) not in planned_targets
+    ):
+        return frontier_action
+
     safe = [
         d
         for d in options
@@ -443,7 +621,7 @@ def agent(obs, config):
                 actions[uid] = fuel
             else:
                 actions[uid] = scout_explore_action(
-                    col, row, can_go, planned_targets, uid
+                    col, row, can_go, planned_targets, uid, obs, config
                 )
             scout_prev_cell[uid] = f"{col},{row}"
 
@@ -489,7 +667,9 @@ def agent(obs, config):
                 elif remembered_mining_nodes:
                     target_key = closest_node(col, row, remembered_mining_nodes)
                     target_col, target_row = parse_pos_key(target_key)
-                    actions[uid] = step_toward(col, row, target_col, target_row, can_go)
+                    actions[uid] = step_toward(
+                        col, row, target_col, target_row, can_go, obs, config
+                    )
                 elif can_go["NORTH"]:
                     actions[uid] = "NORTH"
                 else:
