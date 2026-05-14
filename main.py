@@ -3,11 +3,14 @@ from random import choice
 
 remembered_mining_nodes = set()
 remembered_crystals = {}
+remembered_enemies = {}
 scout_prev_cell = {}
 factory_lane_col = None
 last_seen_step = -1
 
 CRYSTAL_MEMORY_TURNS = 6
+ENEMY_MEMORY_TURNS = 8
+ENDGAME_NO_BUILD_STEP = 380
 INVALID_UTILITY = -10**6
 DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
 DIRECTION_DELTAS = {
@@ -332,22 +335,101 @@ def count_robots_by_type(my_robots):
     return counts
 
 
-def choose_factory_build(energy, config, counts, remembered_nodes):
+def update_remembered_enemies(obs):
+    for uid, data in obs.robots.items():
+        if data[4] == obs.player:
+            continue
+        remembered_enemies[uid] = {
+            "type": data[0],
+            "col": data[1],
+            "row": data[2],
+            "energy": data[3],
+            "step": obs.step,
+        }
+    for uid in list(remembered_enemies):
+        row = remembered_enemies[uid]["row"]
+        if row < obs.southBound:
+            remembered_enemies.pop(uid, None)
+            continue
+        if obs.step - remembered_enemies[uid]["step"] > ENEMY_MEMORY_TURNS:
+            remembered_enemies.pop(uid, None)
+
+
+def enemy_unit_counts():
+    return {
+        t: sum(1 for e in remembered_enemies.values() if e["type"] == t)
+        for t in (0, 1, 2, 3)
+    }
+
+
+def count_enemy_mines(obs):
+    return sum(1 for _, mine in obs.mines.items() if mine[2] != obs.player)
+
+
+def choose_factory_build(
+    energy, config, counts, remembered_nodes, obs, enemy_count, enemy_mines
+):
+    if obs.step > ENDGAME_NO_BUILD_STEP:
+        return None
+
     scouts = counts[1]
     workers = counts[2]
     miners = counts[3]
+    step = obs.step
 
-    if scouts < 2 and energy >= config.scoutCost:
+    if scouts == 0 and energy >= config.scoutCost:
         return "BUILD_SCOUT"
-    if miners < 1 and remembered_nodes and energy >= config.minerCost:
-        return "BUILD_MINER"
-    if workers < 1 and energy >= config.workerCost:
-        return "BUILD_WORKER"
-    if scouts < 4 and energy >= config.scoutCost:
-        return "BUILD_SCOUT"
-    if miners < 2 and remembered_nodes and energy >= config.minerCost:
-        return "BUILD_MINER"
-    return None
+
+    def scout_score():
+        s = 5
+        if scouts < 2:
+            s += 8
+        if step < 60 and not remembered_nodes:
+            s += 4
+        if enemy_count[1] >= 3:
+            s += 3
+        if scouts >= 2 and workers == 0:
+            s -= 6
+        return s
+
+    def worker_score():
+        s = 3
+        if enemy_count[1] >= 2:
+            s += 6
+        if workers == 0 and step > 25:
+            s += 4
+        if enemy_count[2] >= 1 and workers < 2:
+            s += 3
+        if scouts >= 2 and workers == 0:
+            s += 10
+        return s
+
+    def miner_score():
+        if not remembered_nodes:
+            return -1
+        s = 2
+        s += 5
+        if enemy_mines >= 1:
+            s -= 3
+        if enemy_count[2] >= 1:
+            s += 2
+        if miners == 0:
+            s += 4
+        return s
+
+    candidates = []
+    if energy >= config.scoutCost and scouts < 4:
+        candidates.append(("BUILD_SCOUT", scout_score()))
+    if energy >= config.workerCost and workers < 2:
+        candidates.append(("BUILD_WORKER", worker_score()))
+    if energy >= config.minerCost and miners < 2 and remembered_nodes:
+        ms = miner_score()
+        if ms >= 0:
+            candidates.append(("BUILD_MINER", ms))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1])[0]
 
 
 def pick_move(col, row, can_go, planned_targets, prefer_north=True):
@@ -771,6 +853,7 @@ def agent(obs, config):
     if obs.step <= last_seen_step:
         remembered_mining_nodes.clear()
         remembered_crystals.clear()
+        remembered_enemies.clear()
         scout_prev_cell.clear()
         factory_lane_col = None
     last_seen_step = obs.step
@@ -789,6 +872,9 @@ def agent(obs, config):
             remembered_mining_nodes.discard(pos_key)
 
     update_remembered_crystals(obs)
+    update_remembered_enemies(obs)
+    enemy_count = enemy_unit_counts()
+    enemy_mines = count_enemy_mines(obs)
 
     occupied_by_me = set()
     for _, data in my_robots.items():
@@ -839,7 +925,13 @@ def agent(obs, config):
             if factory_lane_col is None or obs.step % 8 == 0:
                 factory_lane_col = choose_factory_lane_col(col, row, obs, config)
             build_action = choose_factory_build(
-                energy, config, robot_counts, remembered_mining_nodes
+                energy,
+                config,
+                robot_counts,
+                remembered_mining_nodes,
+                obs,
+                enemy_count,
+                enemy_mines,
             )
             can_build = (
                 build_cd == 0

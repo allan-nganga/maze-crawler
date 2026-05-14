@@ -11,6 +11,7 @@ State resets when `obs.step` does not increase (a new game).
 | `remembered_mining_nodes` | Mining node positions seen in fog; used to send miners after nodes leave vision |
 | `remembered_crystals` | Recently seen crystals (`energy`, `last_seen_step`); kept up to 6 turns after leaving vision |
 | `scout_prev_cell` | Last cell each scout occupied; used to avoid immediately walking back into a dead end |
+| `remembered_enemies` | Last known type/position of visible enemy robots (by UID), pruned after 8 turns or when below `southBound` |
 
 ## Shared helpers
 
@@ -41,13 +42,14 @@ Crush hierarchy: Factory > Miner > Worker > Scout. Same type on one cell destroy
 
 The factory does not hunt crystals or refuel.
 
-**Build order** when spawn is safe, build cooldown is ready, and scroll margin is greater than 2:
+**Build order** when spawn is safe, build cooldown is ready, scroll margin is greater than 2, and before step 380:
 
-1. Scouts until 2
-2. Miner if a remembered mining node exists
-3. Worker until 1
-4. Scouts until 4
-5. Second miner if nodes are remembered
+- Always build at least one scout for vision.
+- Among affordable builds (scout up to 4 total, up to 2 workers, up to 2 miners when nodes are remembered), pick the action with the highest **score** from enemy-informed heuristics:
+  - **Scouts:** boosted early and when no mining nodes are remembered yet; extra boost if many enemy scouts were seen.
+  - **Workers:** boosted when the enemy has two or more scouts (crush), when we have no worker after step 25, or when an enemy worker is known.
+  - **Miners:** only if remembered mining nodes exist; boosted for first miner and when an enemy worker is known; slightly penalized if enemy mines are already on the map.
+- After step **380**, the factory stops building to preserve energy for tiebreaks.
 
 **Movement:**
 
