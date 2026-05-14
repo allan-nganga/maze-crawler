@@ -4,9 +4,11 @@ from random import choice
 remembered_mining_nodes = set()
 remembered_crystals = {}
 scout_prev_cell = {}
+factory_lane_col = None
 last_seen_step = -1
 
 CRYSTAL_MEMORY_TURNS = 6
+INVALID_UTILITY = -10**6
 DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
 DIRECTION_DELTAS = {
     "NORTH": (0, 1),
@@ -71,6 +73,35 @@ def crush_outcome(attacker_type, defender_type):
 
 def in_bounds(col, row, obs, config):
     return 0 <= col < config.width and obs.southBound <= row <= obs.northBound
+
+
+def get_scroll_interval(step, config):
+    if step >= config.scrollRampSteps:
+        return config.scrollEndInterval
+    progress = step / max(1, config.scrollRampSteps)
+    interval = config.scrollStartInterval - (
+        config.scrollStartInterval - config.scrollEndInterval
+    ) * progress
+    return max(config.scrollEndInterval, round(interval))
+
+
+def project_south_bound(obs, config, turns_ahead):
+    south = obs.southBound
+    counter = getattr(obs, "scrollCounter", get_scroll_interval(obs.step, config))
+    step = obs.step
+
+    for _ in range(max(0, turns_ahead)):
+        counter -= 1
+        if counter <= 0:
+            south += 1
+            counter = get_scroll_interval(step, config)
+        step += 1
+    return south
+
+
+def is_row_scroll_safe(row, obs, config, turns_ahead=0, buffer_rows=1):
+    future_south = project_south_bound(obs, config, turns_ahead)
+    return row - future_south >= buffer_rows
 
 
 def wall_value(col, row, obs, config):
@@ -212,6 +243,66 @@ def bfs_first_step_to_frontier(start_col, start_row, can_go, obs, config, planne
     return None
 
 
+def bfs_distances(start_col, start_row, obs, config):
+    start = (start_col, start_row)
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return {}
+
+    queue = deque([start])
+    distances = {start: 0}
+    while queue:
+        col, row = queue.popleft()
+        for direction in DIR_ORDER:
+            if not can_move_known(col, row, direction, obs, config):
+                continue
+            next_col, next_row = next_cell(col, row, direction)
+            state = (next_col, next_row)
+            if state in distances:
+                continue
+            distances[state] = distances[(col, row)] + 1
+            queue.append(state)
+    return distances
+
+
+def north_run_length(col, row, obs, config, max_steps=8):
+    run = 0
+    cur_col = col
+    cur_row = row
+    for _ in range(max_steps):
+        if not can_move_known(cur_col, cur_row, "NORTH", obs, config):
+            break
+        cur_col, cur_row = next_cell(cur_col, cur_row, "NORTH")
+        run += 1
+    return run
+
+
+def choose_factory_lane_col(factory_col, factory_row, obs, config):
+    distances = bfs_distances(factory_col, factory_row, obs, config)
+    if not distances:
+        return factory_col
+
+    lane_scores = {}
+    center_col = config.width // 2
+    for (col, row), dist in distances.items():
+        if row < factory_row:
+            continue
+        progress = row - factory_row
+        if progress == 0 and dist > 0:
+            continue
+        if not is_row_scroll_safe(row, obs, config, turns_ahead=dist, buffer_rows=1):
+            continue
+        run = north_run_length(col, row, obs, config)
+        center_bias = -abs(col - center_col)
+        score = progress * 4 + run * 6 - dist * 2 + center_bias
+        best = lane_scores.get(col)
+        if best is None or score > best:
+            lane_scores[col] = score
+
+    if not lane_scores:
+        return factory_col
+    return max(lane_scores.items(), key=lambda item: item[1])[0]
+
+
 def step_toward(col, row, target_col, target_row, can_go, obs, config):
     action = bfs_first_step_to_target(col, row, target_col, target_row, obs, config)
     if action is not None:
@@ -324,12 +415,15 @@ def visible_crystal_targets(obs):
     return targets
 
 
-def score_crystal(col, row, rtype, crystal_key, crystal_energy, obs, hungry):
+def score_crystal(
+    col, row, rtype, crystal_key, crystal_energy, obs, hungry, distance=None
+):
     target_col, target_row = parse_pos_key(crystal_key)
     if target_row < row:
         return None
 
-    distance = manhattan(col, row, target_col, target_row)
+    if distance is None:
+        distance = manhattan(col, row, target_col, target_row)
     if distance == 0:
         return None
 
@@ -362,19 +456,157 @@ def score_crystal(col, row, rtype, crystal_key, crystal_energy, obs, hungry):
     return None
 
 
-def pick_best_crystal(col, row, rtype, energy, obs, planned_crystal_claims, hungry):
+def pick_best_crystal(
+    col,
+    row,
+    rtype,
+    energy,
+    obs,
+    planned_crystal_claims,
+    hungry,
+    distance_map=None,
+):
     best_key = None
     best_score = None
     for crystal_key, crystal_energy in visible_crystal_targets(obs).items():
         if crystal_key in planned_crystal_claims:
             continue
-        score = score_crystal(col, row, rtype, crystal_key, crystal_energy, obs, hungry)
+        distance = None
+        if distance_map is not None:
+            target_col, target_row = parse_pos_key(crystal_key)
+            distance = distance_map.get((target_col, target_row))
+            if distance is None:
+                continue
+        score = score_crystal(
+            col, row, rtype, crystal_key, crystal_energy, obs, hungry, distance=distance
+        )
         if score is None:
             continue
         if best_score is None or score > best_score:
             best_key = crystal_key
             best_score = score
     return best_key
+
+
+def hungarian_maximize(utility_matrix):
+    if not utility_matrix or not utility_matrix[0]:
+        return []
+
+    rows = len(utility_matrix)
+    cols = len(utility_matrix[0])
+    max_utility = max(max(row) for row in utility_matrix)
+    costs = [
+        [max_utility - utility_matrix[r][c] for c in range(cols)]
+        for r in range(rows)
+    ]
+
+    u = [0] * (rows + 1)
+    v = [0] * (cols + 1)
+    p = [0] * (cols + 1)
+    way = [0] * (cols + 1)
+
+    for i in range(1, rows + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (cols + 1)
+        used = [False] * (cols + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, cols + 1):
+                if used[j]:
+                    continue
+                cur = costs[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(cols + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [-1] * rows
+    for j in range(1, cols + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def assign_crystals_to_units(my_robots, obs, config, crystal_targets):
+    mobile_units = []
+    for uid, data in my_robots.items():
+        rtype = data[0]
+        if rtype == 0:
+            continue
+        col, row, energy = data[1], data[2], data[3]
+        if row - obs.southBound <= 4:
+            continue
+        pos_key = f"{col},{row}"
+        if (
+            pos_key in obs.mines
+            and obs.mines[pos_key][2] == obs.player
+            and energy_is_low(rtype, energy, config)
+        ):
+            continue
+        mobile_units.append((uid, rtype, col, row, energy))
+
+    crystal_keys = list(crystal_targets.keys())
+    if not mobile_units or not crystal_keys:
+        return {}
+
+    # Give solver an explicit "no crystal" option per unit.
+    total_cols = len(crystal_keys) + len(mobile_units)
+    utility = [[0] * total_cols for _ in mobile_units]
+
+    for unit_idx, (_, rtype, col, row, energy) in enumerate(mobile_units):
+        hungry = energy_is_low(rtype, energy, config)
+        distance_map = bfs_distances(col, row, obs, config)
+        for crystal_idx, crystal_key in enumerate(crystal_keys):
+            target_col, target_row = parse_pos_key(crystal_key)
+            distance = distance_map.get((target_col, target_row))
+            if distance is None:
+                utility[unit_idx][crystal_idx] = INVALID_UTILITY
+                continue
+            score = score_crystal(
+                col,
+                row,
+                rtype,
+                crystal_key,
+                crystal_targets[crystal_key],
+                obs,
+                hungry,
+                distance=distance,
+            )
+            if score is None:
+                utility[unit_idx][crystal_idx] = INVALID_UTILITY
+            else:
+                utility[unit_idx][crystal_idx] = int(score * 10)
+
+    assignment = hungarian_maximize(utility)
+    assigned = {}
+    for unit_idx, col_idx in enumerate(assignment):
+        if col_idx < 0 or col_idx >= len(crystal_keys):
+            continue
+        if utility[unit_idx][col_idx] <= 0:
+            continue
+        assigned[mobile_units[unit_idx][0]] = crystal_keys[col_idx]
+    return assigned
 
 
 def transfer_to_factory_action(col, row, rtype, energy, obs, my_robots, can_go):
@@ -409,6 +641,7 @@ def transfer_to_factory_action(col, row, rtype, energy, obs, my_robots, can_go):
 
 
 def fuel_action(
+    uid,
     col,
     row,
     rtype,
@@ -418,6 +651,7 @@ def fuel_action(
     can_go,
     planned_targets,
     planned_crystal_claims,
+    assigned_crystals,
     my_robots,
 ):
     if rtype == 0:
@@ -438,9 +672,23 @@ def fuel_action(
         return transfer, None
 
     hungry = energy_is_low(rtype, energy, config)
-    crystal_key = pick_best_crystal(
-        col, row, rtype, energy, obs, planned_crystal_claims, hungry
-    )
+    distance_map = bfs_distances(col, row, obs, config)
+    crystal_key = assigned_crystals.get(uid)
+    if crystal_key is None or crystal_key in planned_crystal_claims:
+        crystal_key = pick_best_crystal(
+            col,
+            row,
+            rtype,
+            energy,
+            obs,
+            planned_crystal_claims,
+            hungry,
+            distance_map=distance_map,
+        )
+    if crystal_key is not None:
+        target_col, target_row = parse_pos_key(crystal_key)
+        if (target_col, target_row) not in distance_map:
+            crystal_key = None
     if crystal_key is not None:
         target_col, target_row = parse_pos_key(crystal_key)
         return (
@@ -518,12 +766,13 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
 
 
 def agent(obs, config):
-    global last_seen_step
+    global last_seen_step, factory_lane_col
 
     if obs.step <= last_seen_step:
         remembered_mining_nodes.clear()
         remembered_crystals.clear()
         scout_prev_cell.clear()
+        factory_lane_col = None
     last_seen_step = obs.step
 
     actions = {}
@@ -548,6 +797,10 @@ def agent(obs, config):
     robot_counts = count_robots_by_type(my_robots)
     planned_targets = set()
     planned_crystal_claims = set()
+    crystal_targets = visible_crystal_targets(obs)
+    assigned_crystals = assign_crystals_to_units(
+        my_robots, obs, config, crystal_targets
+    )
 
     ordered_uids = [
         uid for uid, data in my_robots.items() if data[0] != 0
@@ -580,6 +833,11 @@ def agent(obs, config):
             spawn_key = f"{col},{row + 1}"
             spawn_is_safe = spawn_key not in occupied_by_me and spawn_key not in planned_targets
             scroll_margin = row - obs.southBound
+            urgent_scroll = not is_row_scroll_safe(
+                row, obs, config, turns_ahead=4, buffer_rows=2
+            )
+            if factory_lane_col is None or obs.step % 8 == 0:
+                factory_lane_col = choose_factory_lane_col(col, row, obs, config)
             build_action = choose_factory_build(
                 energy, config, robot_counts, remembered_mining_nodes
             )
@@ -588,24 +846,47 @@ def agent(obs, config):
                 and build_action is not None
                 and spawn_is_safe
                 and scroll_margin > 2
+                and not urgent_scroll
+            )
+            lane_direction = None
+            if factory_lane_col is not None and factory_lane_col != col:
+                if factory_lane_col > col and can_go["EAST"]:
+                    lane_direction = "EAST"
+                elif factory_lane_col < col and can_go["WEST"]:
+                    lane_direction = "WEST"
+            if lane_direction is not None:
+                lane_target_key = target_cell(col, row, lane_direction)
+                if lane_target_key in planned_targets:
+                    lane_direction = None
+            can_lane_shift = (
+                lane_direction is not None
+                and not urgent_scroll
+                and scroll_margin >= 8
+                and is_row_scroll_safe(row, obs, config, turns_ahead=2, buffer_rows=3)
             )
 
             if move_cd > 0:
                 actions[uid] = build_action if can_build else "IDLE"
-            elif scroll_margin <= 2 and can_go["NORTH"]:
+            elif urgent_scroll and can_go["NORTH"]:
                 actions[uid] = "NORTH"
             elif not can_go["NORTH"]:
                 jump_cd = data[6]
                 if jump_cd == 0:
                     actions[uid] = "JUMP_NORTH"
+                elif can_lane_shift:
+                    actions[uid] = lane_direction
                 else:
                     side = [d for d in ["EAST", "WEST"] if can_go[d]]
                     actions[uid] = choice(side) if side else "IDLE"
             else:
-                actions[uid] = build_action if can_build else "NORTH"
+                if can_lane_shift:
+                    actions[uid] = lane_direction
+                else:
+                    actions[uid] = build_action if can_build else "NORTH"
 
         elif rtype == 1:
             fuel, crystal_key = fuel_action(
+                uid,
                 col,
                 row,
                 rtype,
@@ -615,6 +896,7 @@ def agent(obs, config):
                 can_go,
                 planned_targets,
                 planned_crystal_claims,
+                assigned_crystals,
                 my_robots,
             )
             if fuel is not None:
@@ -627,6 +909,7 @@ def agent(obs, config):
 
         elif rtype == 2:
             fuel, crystal_key = fuel_action(
+                uid,
                 col,
                 row,
                 rtype,
@@ -636,6 +919,7 @@ def agent(obs, config):
                 can_go,
                 planned_targets,
                 planned_crystal_claims,
+                assigned_crystals,
                 my_robots,
             )
             if fuel is not None:
@@ -651,6 +935,7 @@ def agent(obs, config):
                 actions[uid] = "TRANSFORM"
             else:
                 fuel, crystal_key = fuel_action(
+                    uid,
                     col,
                     row,
                     rtype,
@@ -660,6 +945,7 @@ def agent(obs, config):
                     can_go,
                     planned_targets,
                     planned_crystal_claims,
+                    assigned_crystals,
                     my_robots,
                 )
                 if fuel is not None:

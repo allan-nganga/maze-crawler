@@ -16,8 +16,10 @@ State resets when `obs.step` does not increase (a new game).
 
 - **Walls:** `obs.walls` index is `(row - southBound) * width + col`. Bits N=1, E=2, S=4, W=8.
 - **Known-wall BFS:** goal pathing uses BFS over discovered cells (`obs.walls != -1`) instead of greedy axis steps, so units route around known wall mazes with fewer wasted moves.
+- **Scroll projection:** future `southBound` is projected from `scrollCounter` and config intervals to avoid actions that leave the factory too close to the rising floor.
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
-- **Crystal claims:** When a unit commits to a scored crystal, that crystal key is added to `planned_crystal_claims` so another friendly does not chase the same snack.
+- **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using BFS reachability + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
+- **Crystal claims:** After action selection, claimed crystal keys are still tracked in `planned_crystal_claims` to prevent same-turn duplicates if fallback logic triggers.
 
 ## Combat awareness on crystals
 
@@ -49,9 +51,10 @@ The factory does not hunt crystals or refuel.
 
 **Movement:**
 
-- Within 2 rows of `southBound`, move north instead of building.
+- If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
 - If north is blocked and jump is ready, `JUMP_NORTH`; otherwise sidestep east or west.
-- Otherwise build when possible, else move north.
+- The factory commits to a lane column (re-evaluated periodically) chosen by reachable north progress plus local north corridor depth.
+- When safe, it side-steps toward that lane before resuming north/build behavior.
 
 **Spawn safety:** `BUILD_*` only if the cell north of the factory is not occupied by a friendly and not already targeted this turn.
 
