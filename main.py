@@ -1,4 +1,5 @@
 import heapq
+import os
 from collections import deque
 from random import choice
 
@@ -12,6 +13,12 @@ last_seen_step = -1
 CRYSTAL_MEMORY_TURNS = 6
 ENEMY_MEMORY_TURNS = 8
 ENDGAME_NO_BUILD_STEP = 380
+LANE_REEVAL_INTERVAL = 8
+# Require strictly more than this gap vs current lane to switch (ties always keep current).
+# Override: CRAWL_LANE_SWITCH_MARGIN=2 python3 benchmark.py  (see experiment_lane_margin.py)
+LANE_SWITCH_MARGIN = max(
+    0, int(os.environ.get("CRAWL_LANE_SWITCH_MARGIN", "8"))
+)
 INVALID_UTILITY = -10**6
 INF_PATH_COST = 10**9
 DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
@@ -418,10 +425,10 @@ def north_run_length(col, row, obs, config, max_steps=8):
     return run
 
 
-def choose_factory_lane_col(factory_col, factory_row, obs, config):
+def compute_factory_lane_scores(factory_col, factory_row, obs, config):
     distances = bfs_distances(factory_col, factory_row, obs, config)
     if not distances:
-        return factory_col
+        return {}
 
     lane_scores = {}
     center_col = config.width // 2
@@ -439,10 +446,40 @@ def choose_factory_lane_col(factory_col, factory_row, obs, config):
         best = lane_scores.get(col)
         if best is None or score > best:
             lane_scores[col] = score
+    return lane_scores
 
+
+def pick_factory_lane_with_hysteresis(factory_col, current_lane, lane_scores):
     if not lane_scores:
         return factory_col
-    return max(lane_scores.items(), key=lambda item: item[1])[0]
+    best_col, best_score = max(lane_scores.items(), key=lambda item: item[1])
+    if current_lane is None:
+        return best_col
+    if current_lane not in lane_scores:
+        return best_col
+    cur_score = lane_scores[current_lane]
+    if cur_score == best_score:
+        return current_lane
+    if best_score > cur_score + LANE_SWITCH_MARGIN:
+        return best_col
+    return current_lane
+
+
+def deterministic_factory_sidestep(col, can_go, config, lane_col=None):
+    side = [d for d in ["EAST", "WEST"] if can_go[d]]
+    if not side:
+        return "IDLE"
+    if len(side) == 1:
+        return side[0]
+    if lane_col is not None and lane_col != col:
+        if lane_col > col and "EAST" in side:
+            return "EAST"
+        if lane_col < col and "WEST" in side:
+            return "WEST"
+    mid = config.width // 2
+    if col < mid:
+        return "EAST" if "EAST" in side else "WEST"
+    return "WEST" if "WEST" in side else "EAST"
 
 
 def step_toward(
@@ -1105,8 +1142,11 @@ def agent(obs, config):
             urgent_scroll = not is_row_scroll_safe(
                 row, obs, config, turns_ahead=4, buffer_rows=2
             )
-            if factory_lane_col is None or obs.step % 8 == 0:
-                factory_lane_col = choose_factory_lane_col(col, row, obs, config)
+            if factory_lane_col is None or obs.step % LANE_REEVAL_INTERVAL == 0:
+                lane_scores = compute_factory_lane_scores(col, row, obs, config)
+                factory_lane_col = pick_factory_lane_with_hysteresis(
+                    col, factory_lane_col, lane_scores
+                )
             build_action = choose_factory_build(
                 energy,
                 config,
@@ -1151,8 +1191,9 @@ def agent(obs, config):
                 elif can_lane_shift:
                     actions[uid] = lane_direction
                 else:
-                    side = [d for d in ["EAST", "WEST"] if can_go[d]]
-                    actions[uid] = choice(side) if side else "IDLE"
+                    actions[uid] = deterministic_factory_sidestep(
+                        col, can_go, config, factory_lane_col
+                    )
             else:
                 if can_lane_shift:
                     actions[uid] = lane_direction

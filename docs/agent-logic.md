@@ -55,8 +55,8 @@ The factory does not hunt crystals or refuel.
 **Movement:**
 
 - If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
-- If north is blocked and jump is ready, `JUMP_NORTH`; otherwise sidestep east or west.
-- The factory commits to a lane column (re-evaluated periodically) chosen by reachable north progress plus local north corridor depth.
+- If north is blocked and jump is ready, `JUMP_NORTH`; otherwise sidestep east or west using a **deterministic** rule: step **toward `factory_lane_col`** when that lane differs from the current column; otherwise **left of map center → prefer `EAST`**, **right of center → prefer `WEST`** (no random wiggle when both sides are open).
+- The factory commits to a **lane column** from BFS lane scores; the lane is **re-evaluated every 8 steps**. If the current lane **ties** the global best score, it **stays** (no arbitrary flip among equals). If another column is strictly better, it still **only switches when its score exceeds the current lane by more than `LANE_SWITCH_MARGIN` (default `8`)** — strong hysteresis tuned empirically via `experiment_lane_margin.py` to prevent fog-driven flip-flop. The margin can be overridden with env `CRAWL_LANE_SWITCH_MARGIN`.
 - When safe, it side-steps toward that lane before resuming north/build behavior.
 
 **Spawn safety:** `BUILD_*` only if the cell north of the factory is not occupied by a friendly and not already targeted this turn.
