@@ -1,3 +1,4 @@
+import heapq
 from collections import deque
 from random import choice
 
@@ -12,6 +13,7 @@ CRYSTAL_MEMORY_TURNS = 6
 ENEMY_MEMORY_TURNS = 8
 ENDGAME_NO_BUILD_STEP = 380
 INVALID_UTILITY = -10**6
+INF_PATH_COST = 10**9
 DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
 DIRECTION_DELTAS = {
     "NORTH": (0, 1),
@@ -137,6 +139,143 @@ def can_move_known(col, row, direction, obs, config):
     if target_w is None or target_w == -1:
         return False
     return True
+
+
+def get_move_period_local(rtype, config):
+    if rtype == 0:
+        return config.factoryMovePeriod
+    if rtype == 1:
+        return 1
+    if rtype == 2:
+        return config.workerMovePeriod
+    if rtype == 3:
+        return config.minerMovePeriod
+    return 1
+
+
+def build_path_ctx(obs, config, rtype, intent, planned_targets, hungry):
+    return {
+        "obs": obs,
+        "config": config,
+        "rtype": rtype,
+        "intent": intent,
+        "hungry": bool(hungry),
+        "planned": planned_targets or set(),
+        "player": obs.player,
+    }
+
+
+def destination_move_cost(to_col, to_row, direction, arrival_turns, ctx):
+    obs = ctx["obs"]
+    config = ctx["config"]
+    rtype = ctx["rtype"]
+    player = ctx["player"]
+
+    if not is_row_scroll_safe(
+        to_row, obs, config, turns_ahead=arrival_turns, buffer_rows=1
+    ):
+        return INF_PATH_COST
+
+    pos_key = f"{to_col},{to_row}"
+    for _, occ_type, owner in robots_at(to_col, to_row, obs):
+        if owner == player:
+            if occ_type == rtype:
+                return INF_PATH_COST
+        else:
+            outcome = crush_outcome(rtype, occ_type)
+            if outcome in ("lose", "both"):
+                return INF_PATH_COST
+
+    w = 2
+    if direction == "SOUTH":
+        w += 3
+    if pos_key in ctx["planned"]:
+        w += 5
+
+    if (
+        ctx["intent"] == "refuel"
+        and ctx["hungry"]
+        and pos_key in obs.mines
+        and obs.mines[pos_key][2] == player
+    ):
+        w = min(w, 1)
+
+    return w
+
+
+def dijkstra_spatial(start_col, start_row, obs, config, ctx, stop_at=None):
+    start = (start_col, start_row)
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return {}, {}, {}
+
+    period = get_move_period_local(ctx["rtype"], config)
+    dist_cost = {start: 0}
+    dist_edges = {start: 0}
+    parent = {}
+    tie = 0
+    heap = [(0, tie, start_col, start_row, 0)]
+
+    while heap:
+        cost, _, col, row, edges = heapq.heappop(heap)
+        state = (col, row)
+        if cost > dist_cost.get(state, INF_PATH_COST):
+            continue
+        if cost == dist_cost[state] and edges > dist_edges.get(state, 0):
+            continue
+        if stop_at is not None and state == stop_at:
+            break
+
+        for direction in DIR_ORDER:
+            if not can_move_known(col, row, direction, obs, config):
+                continue
+            nc, nr = next_cell(col, row, direction)
+            nstate = (nc, nr)
+            new_edges = edges + 1
+            arrival_turns = new_edges * period
+            step_w = destination_move_cost(nc, nr, direction, arrival_turns, ctx)
+            if step_w >= INF_PATH_COST:
+                continue
+            new_cost = cost + step_w
+            old_c = dist_cost.get(nstate, INF_PATH_COST)
+            old_e = dist_edges.get(nstate, INF_PATH_COST)
+            if new_cost < old_c or (new_cost == old_c and new_edges < old_e):
+                dist_cost[nstate] = new_cost
+                dist_edges[nstate] = new_edges
+                parent[nstate] = (col, row, direction)
+                tie += 1
+                heapq.heappush(heap, (new_cost, tie, nc, nr, new_edges))
+
+    return dist_cost, dist_edges, parent
+
+
+def first_step_from_parent(start, goal, parent):
+    if goal == start:
+        return "IDLE"
+    if goal not in parent:
+        return None
+    cur = goal
+    first_dir = None
+    while cur != start:
+        pcol, prow, direction = parent[cur]
+        first_dir = direction
+        cur = (pcol, prow)
+    return first_dir
+
+
+def dijkstra_first_step_to_target(start_col, start_row, goal_col, goal_row, obs, config, ctx):
+    goal = (goal_col, goal_row)
+    start = (start_col, start_row)
+    if start == goal:
+        return "IDLE"
+    if wall_value(goal_col, goal_row, obs, config) in (None, -1):
+        return None
+
+    _, _, parent = dijkstra_spatial(
+        start_col, start_row, obs, config, ctx, stop_at=goal
+    )
+    if goal not in parent:
+        return None
+    return first_step_from_parent(start, goal, parent)
 
 
 def is_frontier_cell(col, row, obs, config):
@@ -306,7 +445,26 @@ def choose_factory_lane_col(factory_col, factory_row, obs, config):
     return max(lane_scores.items(), key=lambda item: item[1])[0]
 
 
-def step_toward(col, row, target_col, target_row, can_go, obs, config):
+def step_toward(
+    col,
+    row,
+    target_col,
+    target_row,
+    can_go,
+    obs,
+    config,
+    rtype=1,
+    planned_targets=None,
+    intent="travel",
+    hungry=False,
+):
+    ctx = build_path_ctx(obs, config, rtype, intent, planned_targets, hungry)
+    action = dijkstra_first_step_to_target(
+        col, row, target_col, target_row, obs, config, ctx
+    )
+    if action is not None:
+        return action
+
     action = bfs_first_step_to_target(col, row, target_col, target_row, obs, config)
     if action is not None:
         return action
@@ -464,8 +622,23 @@ def move_toward_goal(
     obs,
     config,
     prefer_north=True,
+    rtype=1,
+    intent="travel",
+    hungry=False,
 ):
-    action = step_toward(col, row, goal_col, goal_row, can_go, obs, config)
+    action = step_toward(
+        col,
+        row,
+        goal_col,
+        goal_row,
+        can_go,
+        obs,
+        config,
+        rtype=rtype,
+        planned_targets=planned_targets,
+        intent=intent,
+        hungry=hungry,
+    )
     if action == "IDLE":
         return "IDLE"
     if target_cell(col, row, action) in planned_targets:
@@ -658,7 +831,9 @@ def assign_crystals_to_units(my_robots, obs, config, crystal_targets):
 
     for unit_idx, (_, rtype, col, row, energy) in enumerate(mobile_units):
         hungry = energy_is_low(rtype, energy, config)
-        distance_map = bfs_distances(col, row, obs, config)
+        ctx = build_path_ctx(obs, config, rtype, "refuel", set(), hungry)
+        _, dist_edges, _ = dijkstra_spatial(col, row, obs, config, ctx, stop_at=None)
+        distance_map = dist_edges
         for crystal_idx, crystal_key in enumerate(crystal_keys):
             target_col, target_row = parse_pos_key(crystal_key)
             distance = distance_map.get((target_col, target_row))
@@ -754,7 +929,9 @@ def fuel_action(
         return transfer, None
 
     hungry = energy_is_low(rtype, energy, config)
-    distance_map = bfs_distances(col, row, obs, config)
+    path_ctx = build_path_ctx(obs, config, rtype, "refuel", planned_targets, hungry)
+    _, dist_edges, _ = dijkstra_spatial(col, row, obs, config, path_ctx, stop_at=None)
+    distance_map = dist_edges
     crystal_key = assigned_crystals.get(uid)
     if crystal_key is None or crystal_key in planned_crystal_claims:
         crystal_key = pick_best_crystal(
@@ -784,6 +961,9 @@ def fuel_action(
                 obs,
                 config,
                 prefer_north=False,
+                rtype=rtype,
+                intent="refuel",
+                hungry=hungry,
             ),
             crystal_key,
         )
@@ -807,6 +987,9 @@ def fuel_action(
                     obs,
                     config,
                     prefer_north=False,
+                    rtype=rtype,
+                    intent="refuel",
+                    hungry=True,
                 ),
                 None,
             )
@@ -1046,7 +1229,17 @@ def agent(obs, config):
                     target_key = closest_node(col, row, remembered_mining_nodes)
                     target_col, target_row = parse_pos_key(target_key)
                     actions[uid] = step_toward(
-                        col, row, target_col, target_row, can_go, obs, config
+                        col,
+                        row,
+                        target_col,
+                        target_row,
+                        can_go,
+                        obs,
+                        config,
+                        rtype=rtype,
+                        planned_targets=planned_targets,
+                        intent="travel",
+                        hungry=False,
                     )
                 elif can_go["NORTH"]:
                     actions[uid] = "NORTH"

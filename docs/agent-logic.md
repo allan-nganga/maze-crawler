@@ -17,9 +17,10 @@ State resets when `obs.step` does not increase (a new game).
 
 - **Walls:** `obs.walls` index is `(row - southBound) * width + col`. Bits N=1, E=2, S=4, W=8.
 - **Known-wall BFS:** goal pathing uses BFS over discovered cells (`obs.walls != -1`) instead of greedy axis steps, so units route around known wall mazes with fewer wasted moves.
+- **Weighted pathing (Dijkstra):** goal-directed moves (`step_toward`, crystal assignment distances, refuel `move_toward_goal`) use Dijkstra on the known graph with non-negative edge costs: base step cost, south penalty, same-turn collision targets, scroll projection by move count × move period, crush-illegal destinations as blocked, and cheap edges onto friendly mines when refueling while hungry. If Dijkstra finds no path, behavior falls back to unit-cost BFS then greedy axis moves.
 - **Scroll projection:** future `southBound` is projected from `scrollCounter` and config intervals to avoid actions that leave the factory too close to the rising floor.
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
-- **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using BFS reachability + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
+- **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using Dijkstra edge-count distances on the known map + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
 - **Crystal claims:** After action selection, claimed crystal keys are still tracked in `planned_crystal_claims` to prevent same-turn duplicates if fallback logic triggers.
 
 ## Combat awareness on crystals
@@ -66,7 +67,7 @@ The factory does not hunt crystals or refuel.
 
 - Disabled within 4 rows of the scroll line.
 - On a friendly mine while hungry: `IDLE` to collect.
-- Otherwise score visible and remembered crystals; move toward the best unclaimed target.
+- Otherwise score visible and remembered crystals; move toward the best unclaimed target using weighted Dijkstra (edge costs above) with Hungarian-assigned goals when applicable.
 - If still hungry, path to the nearest friendly mine that is not south of the scout.
 
 **Exploration** when not refueling:
