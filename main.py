@@ -318,9 +318,7 @@ def frontier_opening_action(col, row, can_go, obs, config, planned_targets, prev
             continue
         options.append(direction)
 
-    if "NORTH" in options:
-        return "NORTH"
-    return choice(options) if options else None
+    return deterministic_pick_dir(col, options, config, prefer_north=True)
 
 
 def bfs_first_step_to_target(start_col, start_row, goal_col, goal_row, obs, config):
@@ -515,12 +513,31 @@ def step_toward(
     if target_col < col and can_go["WEST"]:
         return "WEST"
     fallback = [d for d in DIR_ORDER if can_go[d]]
-    return choice(fallback) if fallback else "IDLE"
+    if not fallback:
+        return "IDLE"
+    return deterministic_pick_dir(col, fallback, config, prefer_north=False) or "IDLE"
 
 
 def target_cell(col, row, action):
     dcol, drow = DIRECTION_DELTAS.get(action, (0, 0))
     return f"{col + dcol},{row + drow}"
+
+
+def deterministic_pick_dir(col, options, config, prefer_north=True):
+    if not options:
+        return None
+    if prefer_north and "NORTH" in options:
+        return "NORTH"
+    mid = config.width // 2
+    horiz = ("EAST", "WEST") if col < mid else ("WEST", "EAST")
+    for d in horiz:
+        if d in options:
+            return d
+    if not prefer_north and "NORTH" in options:
+        return "NORTH"
+    if "SOUTH" in options:
+        return "SOUTH"
+    return options[0]
 
 
 def count_robots_by_type(my_robots):
@@ -627,16 +644,14 @@ def choose_factory_build(
     return max(candidates, key=lambda item: item[1])[0]
 
 
-def pick_move(col, row, can_go, planned_targets, prefer_north=True):
+def pick_move(col, row, can_go, planned_targets, config, prefer_north=True):
     options = [d for d in DIR_ORDER if can_go[d]]
     if not options:
         return "IDLE"
 
     safe = [d for d in options if target_cell(col, row, d) not in planned_targets]
     pool = safe if safe else options
-    if prefer_north and "NORTH" in pool:
-        return "NORTH"
-    return choice(pool)
+    return deterministic_pick_dir(col, pool, config, prefer_north=prefer_north) or "IDLE"
 
 
 def energy_is_low(rtype, energy, config):
@@ -679,7 +694,7 @@ def move_toward_goal(
     if action == "IDLE":
         return "IDLE"
     if target_cell(col, row, action) in planned_targets:
-        return pick_move(col, row, can_go, planned_targets, prefer_north=prefer_north)
+        return pick_move(col, row, can_go, planned_targets, config, prefer_north=prefer_north)
     return action
 
 
@@ -903,6 +918,69 @@ def assign_crystals_to_units(my_robots, obs, config, crystal_targets):
     return assigned
 
 
+def find_my_factory(my_robots):
+    for data in my_robots.values():
+        if data[0] == 0:
+            return data
+    return None
+
+
+def worker_return_to_factory_action(
+    col, row, energy, config, my_robots, can_go, planned_targets, obs
+):
+    if energy < 120:
+        return None
+    factory = find_my_factory(my_robots)
+    if factory is None:
+        return None
+    fcol, frow = factory[1], factory[2]
+    if manhattan(col, row, fcol, frow) <= 1:
+        return None
+    return move_toward_goal(
+        col,
+        row,
+        can_go,
+        planned_targets,
+        fcol,
+        frow,
+        obs,
+        config,
+        prefer_north=False,
+        rtype=2,
+        intent="travel",
+        hungry=False,
+    )
+
+
+def pick_best_mining_node(
+    col, row, obs, config, planned_mining_claims, distances=None
+):
+    if not remembered_mining_nodes:
+        return None
+    if distances is None:
+        distances = bfs_distances(col, row, obs, config)
+    best_key = None
+    best_metric = None
+    for key in remembered_mining_nodes:
+        if key in planned_mining_claims:
+            continue
+        tc, tr = parse_pos_key(key)
+        if not in_bounds(tc, tr, obs, config):
+            continue
+        dist = distances.get((tc, tr))
+        if dist is None:
+            continue
+        if not is_row_scroll_safe(tr, obs, config, turns_ahead=dist, buffer_rows=1):
+            continue
+        # Prefer closer node; tie-break by more northern (larger row) since the
+        # scroll line keeps creeping up and a northerly node lives longer.
+        metric = (dist, -tr, tc)
+        if best_metric is None or metric < best_metric:
+            best_metric = metric
+            best_key = key
+    return best_key
+
+
 def transfer_to_factory_action(col, row, rtype, energy, obs, my_robots, can_go):
     if rtype != 2 or energy < 120:
         return None
@@ -1062,9 +1140,7 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
     if not pool:
         pool = options
 
-    if "NORTH" in pool:
-        return "NORTH"
-    return choice(pool)
+    return deterministic_pick_dir(col, pool, config, prefer_north=True) or "IDLE"
 
 
 def agent(obs, config):
@@ -1103,6 +1179,7 @@ def agent(obs, config):
     robot_counts = count_robots_by_type(my_robots)
     planned_targets = set()
     planned_crystal_claims = set()
+    planned_mining_claims = set()
     crystal_targets = visible_crystal_targets(obs)
     assigned_crystals = assign_crystals_to_units(
         my_robots, obs, config, crystal_targets
@@ -1240,10 +1317,25 @@ def agent(obs, config):
             )
             if fuel is not None:
                 actions[uid] = fuel
-            elif not can_go["NORTH"] and energy >= config.wallRemoveCost:
-                actions[uid] = "REMOVE_NORTH"
             else:
-                actions[uid] = pick_move(col, row, can_go, planned_targets, prefer_north=True)
+                deliver = worker_return_to_factory_action(
+                    col,
+                    row,
+                    energy,
+                    config,
+                    my_robots,
+                    can_go,
+                    planned_targets,
+                    obs,
+                )
+                if deliver is not None:
+                    actions[uid] = deliver
+                elif not can_go["NORTH"] and energy >= config.wallRemoveCost:
+                    actions[uid] = "REMOVE_NORTH"
+                else:
+                    actions[uid] = pick_move(
+                        col, row, can_go, planned_targets, config, prefer_north=True
+                    )
 
         elif rtype == 3:
             pos_key = f"{col},{row}"
@@ -1267,7 +1359,12 @@ def agent(obs, config):
                 if fuel is not None:
                     actions[uid] = fuel
                 elif remembered_mining_nodes:
-                    target_key = closest_node(col, row, remembered_mining_nodes)
+                    target_key = pick_best_mining_node(
+                        col, row, obs, config, planned_mining_claims
+                    )
+                    if target_key is None:
+                        target_key = closest_node(col, row, remembered_mining_nodes)
+                    planned_mining_claims.add(target_key)
                     target_col, target_row = parse_pos_key(target_key)
                     actions[uid] = step_toward(
                         col,
@@ -1286,7 +1383,10 @@ def agent(obs, config):
                     actions[uid] = "NORTH"
                 else:
                     passable = [d for d in ["EAST", "WEST", "SOUTH"] if can_go[d]]
-                    actions[uid] = choice(passable) if passable else "IDLE"
+                    actions[uid] = (
+                        deterministic_pick_dir(col, passable, config, prefer_north=False)
+                        or "IDLE"
+                    )
 
         planned_targets.add(target_cell(col, row, actions[uid]))
         if crystal_key is not None:

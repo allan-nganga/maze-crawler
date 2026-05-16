@@ -22,6 +22,8 @@ State resets when `obs.step` does not increase (a new game).
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
 - **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using Dijkstra edge-count distances on the known map + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
 - **Crystal claims:** After action selection, claimed crystal keys are still tracked in `planned_crystal_claims` to prevent same-turn duplicates if fallback logic triggers.
+- **Mining-node claims:** Miners share `planned_mining_claims` so two miners on the same turn do not pile onto the same node.
+- **Deterministic fallbacks:** All movement helpers (`step_toward`, `pick_move`, `scout_explore_action`, `frontier_opening_action`, miner sidestep) use `deterministic_pick_dir`: prefer NORTH if allowed, then E/W ordered by **map-center bias** (left half → EAST first, right half → WEST first), then SOUTH. No `random.choice` is used in action selection, so identical states always produce identical moves.
 
 ## Combat awareness on crystals
 
@@ -80,6 +82,8 @@ The factory does not hunt crystals or refuel.
 
 **Energy delivery:** If energy is at least 120 and the factory is adjacent with a clear transfer direction, `TRANSFER_*` all energy to the factory.
 
+**Return-to-factory loop:** If energy reaches at least 120 and the factory is **not** adjacent, the worker actively paths back to the factory (`worker_return_to_factory_action` → `move_toward_goal`). Previously, full workers just kept walking north and never delivered unless they accidentally bumped into the factory.
+
 **Refuel and crystals:** Same scoring and mine rules as scouts when hungry or when a crystal is worth a short detour.
 
 **Default:** Remove the north wall if blocked and affordable; otherwise move north with collision avoidance.
@@ -90,7 +94,7 @@ The factory does not hunt crystals or refuel.
 
 **Otherwise:** Use the same crystal and mine refuel logic as workers and scouts.
 
-**If not refueling:** Step toward the closest remembered mining node, else north, else a random side or south escape.
+**Target selection:** When not refueling, the miner picks the best **remembered mining node** by **BFS edge distance** from its current cell (`pick_best_mining_node`), filtering out nodes that fail the scroll-safety projection for the time it would take to reach them, and tie-breaking by **more-northern** (larger row, longer life before scroll). Claimed nodes go into `planned_mining_claims` so a second miner does not pick the same target. Falls back to Manhattan-closest only if no BFS-reachable node exists.
 
 ## Safety rules
 
