@@ -11,6 +11,8 @@ State resets when `obs.step` does not increase (a new game).
 | `remembered_mining_nodes` | Mining node positions seen in fog; used to send miners after nodes leave vision |
 | `remembered_crystals` | Recently seen crystals (`energy`, `last_seen_step`); kept up to 6 turns after leaving vision |
 | `scout_prev_cell` | Last cell each scout occupied; used to avoid immediately walking back into a dead end |
+| `scout_corridors` | Per-column north runway intel from scouts (`run`, `row`, `step`); pruned after 8 turns or below scroll |
+| `scout_next_lane_col` | Lookahead column: best scout corridor at least 2 rows ahead of the factory |
 | `remembered_enemies` | Last known type/position of visible enemy robots (by UID), pruned after 8 turns or when below `southBound` |
 
 ## Shared helpers
@@ -59,7 +61,7 @@ The factory does not hunt crystals or refuel.
 - If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
 - When **north is open**, always **`NORTH`** first (collects crystals on the north cell; does not build or lane-shift while north is passable).
 - When **north is blocked**: try a short **BFS north-escape** (N/E/W only, scroll-safe rows) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
-- Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`).
+- Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`). Lane BFS scores get a **scout corridor bonus**: each turn scouts with `north_run_length ≥ 3` on known tiles update `scout_corridors`; factory lane scoring adds `run × 8` plus north progress, and an extra boost for `scout_next_lane_col` (lookahead corridor ahead of the factory).
 
 **Spawn safety:** `BUILD_*` only if spawn is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
 
@@ -77,6 +79,7 @@ The factory does not hunt crystals or refuel.
 - If only one direction is open, take it (reverse out of a dead end).
 - Scouts run a frontier search: BFS to the nearest known cell adjacent to unknown space, then push into that opening.
 - If no frontier path exists, prefer north and avoid the previous cell and cells already claimed by another friendly this turn.
+- While exploring, scouts with a clear north runway (`north_run_length ≥ 3`) report that column into **`scout_corridors`** so the factory can bias its committed lane toward scout-discovered paths.
 
 ## Worker (type 2)
 

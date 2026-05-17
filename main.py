@@ -10,10 +10,15 @@ scout_prev_cell = {}
 factory_lane_col = None
 factory_prev_col = None
 factory_last_horiz = None
+scout_corridors = {}
+scout_next_lane_col = None
 last_seen_step = -1
 
 CRYSTAL_MEMORY_TURNS = 6
 ENEMY_MEMORY_TURNS = 8
+SCOUT_CORRIDOR_MEMORY_TURNS = 8
+SCOUT_CORRIDOR_MIN_RUN = 3
+SCOUT_CORRIDOR_LANE_BONUS = 8
 ENDGAME_NO_BUILD_STEP = 380
 LANE_REEVAL_INTERVAL = 8
 # Require strictly more than this gap vs current lane to switch (ties always keep current).
@@ -425,6 +430,59 @@ def north_run_length(col, row, obs, config, max_steps=8):
     return run
 
 
+def prune_scout_corridors(obs, step):
+    for col in list(scout_corridors.keys()):
+        entry = scout_corridors[col]
+        if entry["row"] < obs.southBound:
+            scout_corridors.pop(col, None)
+        elif step - entry["step"] > SCOUT_CORRIDOR_MEMORY_TURNS:
+            scout_corridors.pop(col, None)
+
+
+def update_scout_corridors(obs, config, my_robots, factory_row):
+    global scout_next_lane_col
+
+    step = obs.step
+    prune_scout_corridors(obs, step)
+
+    for data in my_robots.values():
+        if data[0] != 1:
+            continue
+        sc, sr = data[1], data[2]
+        if wall_value(sc, sr, obs, config) in (None, -1):
+            continue
+        if not is_row_scroll_safe(sr, obs, config, turns_ahead=0, buffer_rows=1):
+            continue
+        run = north_run_length(sc, sr, obs, config)
+        if run < SCOUT_CORRIDOR_MIN_RUN:
+            continue
+        prev = scout_corridors.get(sc)
+        if prev is None or run > prev["run"] or (run == prev["run"] and sr > prev["row"]):
+            scout_corridors[sc] = {"run": run, "row": sr, "step": step}
+
+    scout_next_lane_col = None
+    best_metric = None
+    for col, entry in scout_corridors.items():
+        if entry["row"] <= factory_row + 1:
+            continue
+        metric = (entry["row"], entry["run"])
+        if best_metric is None or metric > best_metric:
+            best_metric = metric
+            scout_next_lane_col = col
+
+
+def scout_corridor_lane_bonus(col, factory_row, step):
+    entry = scout_corridors.get(col)
+    if entry is None:
+        return 0
+    if step - entry["step"] > SCOUT_CORRIDOR_MEMORY_TURNS:
+        return 0
+    bonus = entry["run"] * SCOUT_CORRIDOR_LANE_BONUS
+    if entry["row"] > factory_row:
+        bonus += (entry["row"] - factory_row) * 3
+    return bonus
+
+
 def compute_factory_lane_scores(factory_col, factory_row, obs, config):
     distances = bfs_distances(factory_col, factory_row, obs, config)
     if not distances:
@@ -432,6 +490,7 @@ def compute_factory_lane_scores(factory_col, factory_row, obs, config):
 
     lane_scores = {}
     center_col = config.width // 2
+    step = obs.step
     for (col, row), dist in distances.items():
         if row < factory_row:
             continue
@@ -443,6 +502,9 @@ def compute_factory_lane_scores(factory_col, factory_row, obs, config):
         run = north_run_length(col, row, obs, config)
         center_bias = -abs(col - center_col)
         score = progress * 4 + run * 6 - dist * 2 + center_bias
+        score += scout_corridor_lane_bonus(col, factory_row, step)
+        if scout_next_lane_col is not None and col == scout_next_lane_col:
+            score += 12
         best = lane_scores.get(col)
         if best is None or score > best:
             lane_scores[col] = score
@@ -1295,12 +1357,15 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
 
 def agent(obs, config):
     global last_seen_step, factory_lane_col, factory_prev_col, factory_last_horiz
+    global scout_corridors, scout_next_lane_col
 
     if obs.step <= last_seen_step:
         remembered_mining_nodes.clear()
         remembered_crystals.clear()
         remembered_enemies.clear()
         scout_prev_cell.clear()
+        scout_corridors.clear()
+        scout_next_lane_col = None
         factory_lane_col = None
         factory_prev_col = None
         factory_last_horiz = None
@@ -1336,6 +1401,13 @@ def agent(obs, config):
     assigned_crystals = assign_crystals_to_units(
         my_robots, obs, config, crystal_targets
     )
+
+    factory_row = obs.southBound
+    for data in my_robots.values():
+        if data[0] == 0:
+            factory_row = data[2]
+            break
+    update_scout_corridors(obs, config, my_robots, factory_row)
 
     ordered_uids = [
         uid for uid, data in my_robots.items() if data[0] != 0
