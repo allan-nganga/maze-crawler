@@ -8,6 +8,8 @@ remembered_crystals = {}
 remembered_enemies = {}
 scout_prev_cell = {}
 factory_lane_col = None
+factory_prev_col = None
+factory_last_horiz = None
 last_seen_step = -1
 
 CRYSTAL_MEMORY_TURNS = 6
@@ -463,6 +465,109 @@ def pick_factory_lane_with_hysteresis(factory_col, current_lane, lane_scores):
     return current_lane
 
 
+def crystal_energy_at(col, row, obs):
+    key = f"{col},{row}"
+    if key in obs.crystals:
+        return obs.crystals[key]
+    if key in remembered_crystals:
+        return remembered_crystals[key][0]
+    return None
+
+
+def factory_spawn_is_safe(
+    col, row, obs, config, occupied_by_me, planned_targets, my_robots
+):
+    spawn_col, spawn_row = col, row + 1
+    spawn_key = f"{spawn_col},{spawn_row}"
+    if spawn_key in occupied_by_me or spawn_key in planned_targets:
+        return False
+    if not in_bounds(spawn_col, spawn_row, obs, config):
+        return False
+    if wall_value(spawn_col, spawn_row, obs, config) in (None, -1):
+        return False
+
+    crystal_e = crystal_energy_at(spawn_col, spawn_row, obs)
+    if crystal_e is not None and crystal_e >= 5:
+        return False
+
+    for _, data in my_robots.items():
+        if data[0] == 0:
+            continue
+        ucol, urow = data[1], data[2]
+        if ucol == spawn_col and urow == spawn_row:
+            return False
+        if ucol == spawn_col and urow == spawn_row:
+            return False
+
+    return True
+
+
+def factory_jump_north_is_safe(
+    col, row, obs, config, occupied_by_me, planned_targets, urgent_scroll, can_go
+):
+    land_col, land_row = col, row + 2
+    if not in_bounds(land_col, land_row, obs, config):
+        return False
+    land_key = f"{land_col},{land_row}"
+    if land_key in occupied_by_me or land_key in planned_targets:
+        return False
+    if wall_value(land_col, land_row, obs, config) in (None, -1):
+        return False
+
+    if not urgent_scroll:
+        mid_crystal = crystal_energy_at(col, row + 1, obs)
+        if mid_crystal is not None and mid_crystal >= 15:
+            if can_go.get("EAST") or can_go.get("WEST"):
+                return False
+
+    land_crystal = crystal_energy_at(land_col, land_row, obs)
+    if land_crystal is not None and land_crystal >= 30 and not urgent_scroll:
+        return False
+    return True
+
+
+def factory_local_north_escape(col, row, can_go, obs, config, planned_targets, max_depth=6):
+    """BFS for a short path to a cell from which north is open (known walls)."""
+    start = (col, row)
+    if wall_value(col, row, obs, config) in (None, -1):
+        return None
+
+    queue = deque([(start, 0)])
+    visited = {start}
+    first_step = {}
+
+    while queue:
+        (cur_col, cur_row), depth = queue.popleft()
+        if can_move_known(cur_col, cur_row, "NORTH", obs, config):
+            if (cur_col, cur_row) == start:
+                return "NORTH" if can_go.get("NORTH") else None
+            return first_step.get((cur_col, cur_row))
+
+        if depth >= max_depth:
+            continue
+
+        for direction in ("NORTH", "EAST", "WEST"):
+            if not can_move_known(cur_col, cur_row, direction, obs, config):
+                continue
+            next_col, next_row = next_cell(cur_col, cur_row, direction)
+            if not is_row_scroll_safe(next_row, obs, config, turns_ahead=0, buffer_rows=2):
+                continue
+            nstate = (next_col, next_row)
+            if nstate in visited:
+                continue
+            nkey = f"{next_col},{next_row}"
+            if (cur_col, cur_row) == start and nkey in planned_targets:
+                continue
+
+            visited.add(nstate)
+            first_step[nstate] = (
+                direction if (cur_col, cur_row) == start else first_step[(cur_col, cur_row)]
+            )
+            queue.append((nstate, depth + 1))
+
+    return None
+
+
 def deterministic_factory_sidestep(col, can_go, config, lane_col=None):
     side = [d for d in ["EAST", "WEST"] if can_go[d]]
     if not side:
@@ -478,6 +583,51 @@ def deterministic_factory_sidestep(col, can_go, config, lane_col=None):
     if col < mid:
         return "EAST" if "EAST" in side else "WEST"
     return "WEST" if "WEST" in side else "EAST"
+
+
+def choose_factory_blocked_move(
+    col,
+    row,
+    can_go,
+    obs,
+    config,
+    planned_targets,
+    occupied_by_me,
+    urgent_scroll,
+    jump_cd,
+    lane_direction,
+    can_lane_shift,
+    factory_lane_col,
+):
+    global factory_prev_col, factory_last_horiz
+
+    escape = factory_local_north_escape(
+        col, row, can_go, obs, config, planned_targets
+    )
+    if escape is not None:
+        dest = target_cell(col, row, escape)
+        if dest not in planned_targets:
+            return escape
+
+    oscillating = (
+        factory_prev_col == col
+        and factory_last_horiz in ("EAST", "WEST")
+        and north_run_length(col, row, obs, config) == 0
+    )
+    if oscillating and escape is not None:
+        dest = target_cell(col, row, escape)
+        if dest not in planned_targets:
+            return escape
+
+    if jump_cd == 0 and factory_jump_north_is_safe(
+        col, row, obs, config, occupied_by_me, planned_targets, urgent_scroll, can_go
+    ):
+        return "JUMP_NORTH"
+
+    if can_lane_shift and lane_direction is not None:
+        return lane_direction
+
+    return deterministic_factory_sidestep(col, can_go, config, factory_lane_col)
 
 
 def step_toward(
@@ -1144,7 +1294,7 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
 
 
 def agent(obs, config):
-    global last_seen_step, factory_lane_col
+    global last_seen_step, factory_lane_col, factory_prev_col, factory_last_horiz
 
     if obs.step <= last_seen_step:
         remembered_mining_nodes.clear()
@@ -1152,6 +1302,8 @@ def agent(obs, config):
         remembered_enemies.clear()
         scout_prev_cell.clear()
         factory_lane_col = None
+        factory_prev_col = None
+        factory_last_horiz = None
     last_seen_step = obs.step
 
     actions = {}
@@ -1213,11 +1365,12 @@ def agent(obs, config):
         }
 
         if rtype == 0:
-            spawn_key = f"{col},{row + 1}"
-            spawn_is_safe = spawn_key not in occupied_by_me and spawn_key not in planned_targets
             scroll_margin = row - obs.southBound
             urgent_scroll = not is_row_scroll_safe(
                 row, obs, config, turns_ahead=4, buffer_rows=2
+            )
+            spawn_is_safe = factory_spawn_is_safe(
+                col, row, obs, config, occupied_by_me, planned_targets, my_robots
             )
             if factory_lane_col is None or obs.step % LANE_REEVAL_INTERVAL == 0:
                 lane_scores = compute_factory_lane_scores(col, row, obs, config)
@@ -1240,6 +1393,19 @@ def agent(obs, config):
                 and scroll_margin > 2
                 and not urgent_scroll
             )
+            must_build = can_build and (
+                robot_counts[1] == 0
+                or (
+                    robot_counts[2] == 0
+                    and robot_counts[1] >= 1
+                    and obs.step > 25
+                )
+                or (
+                    robot_counts[3] == 0
+                    and robot_counts[1] >= 1
+                    and remembered_mining_nodes
+                )
+            )
             lane_direction = None
             if factory_lane_col is not None and factory_lane_col != col:
                 if factory_lane_col > col and can_go["EAST"]:
@@ -1252,30 +1418,45 @@ def agent(obs, config):
                     lane_direction = None
             can_lane_shift = (
                 lane_direction is not None
+                and not can_go["NORTH"]
                 and not urgent_scroll
                 and scroll_margin >= 8
                 and is_row_scroll_safe(row, obs, config, turns_ahead=2, buffer_rows=3)
             )
+            jump_cd = data[6]
 
             if move_cd > 0:
                 actions[uid] = build_action if can_build else "IDLE"
             elif urgent_scroll and can_go["NORTH"]:
                 actions[uid] = "NORTH"
-            elif not can_go["NORTH"]:
-                jump_cd = data[6]
-                if jump_cd == 0:
-                    actions[uid] = "JUMP_NORTH"
-                elif can_lane_shift:
-                    actions[uid] = lane_direction
-                else:
-                    actions[uid] = deterministic_factory_sidestep(
-                        col, can_go, config, factory_lane_col
-                    )
+            elif must_build:
+                actions[uid] = build_action
+            elif can_go["NORTH"]:
+                actions[uid] = "NORTH"
+            elif can_build:
+                actions[uid] = build_action
             else:
-                if can_lane_shift:
-                    actions[uid] = lane_direction
-                else:
-                    actions[uid] = build_action if can_build else "NORTH"
+                actions[uid] = choose_factory_blocked_move(
+                    col,
+                    row,
+                    can_go,
+                    obs,
+                    config,
+                    planned_targets,
+                    occupied_by_me,
+                    urgent_scroll,
+                    jump_cd,
+                    lane_direction,
+                    can_lane_shift,
+                    factory_lane_col,
+                )
+
+            if actions[uid] in ("EAST", "WEST"):
+                factory_last_horiz = actions[uid]
+                factory_prev_col = col
+            elif actions[uid] != "IDLE":
+                factory_last_horiz = None
+                factory_prev_col = col
 
         elif rtype == 1:
             fuel, crystal_key = fuel_action(

@@ -57,11 +57,11 @@ The factory does not hunt crystals or refuel.
 **Movement:**
 
 - If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
-- If north is blocked and jump is ready, `JUMP_NORTH`; otherwise sidestep east or west using a **deterministic** rule: step **toward `factory_lane_col`** when that lane differs from the current column; otherwise **left of map center → prefer `EAST`**, **right of center → prefer `WEST`** (no random wiggle when both sides are open).
-- The factory commits to a **lane column** from BFS lane scores; the lane is **re-evaluated every 8 steps**. If the current lane **ties** the global best score, it **stays** (no arbitrary flip among equals). If another column is strictly better, it still **only switches when its score exceeds the current lane by more than `LANE_SWITCH_MARGIN` (default `8`)** — strong hysteresis tuned empirically via `experiment_lane_margin.py` to prevent fog-driven flip-flop. The margin can be overridden with env `CRAWL_LANE_SWITCH_MARGIN`.
-- When safe, it side-steps toward that lane before resuming north/build behavior.
+- When **north is open**, always **`NORTH`** first (collects crystals on the north cell; does not build or lane-shift while north is passable).
+- When **north is blocked**: try a short **BFS north-escape** (N/E/W only, scroll-safe rows) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
+- Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`).
 
-**Spawn safety:** `BUILD_*` only if the cell north of the factory is not occupied by a friendly and not already targeted this turn.
+**Spawn safety:** `BUILD_*` only if spawn is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
 
 ## Scout (type 1)
 
