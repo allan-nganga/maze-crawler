@@ -63,7 +63,16 @@ The factory does not hunt crystals or refuel.
 - When **north is blocked**: try a short **BFS north-escape** (N/E/W only, scroll-safe rows) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
 - Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`). Lane BFS scores get a **scout corridor bonus**: each turn scouts with `north_run_length ≥ 3` on known tiles update `scout_corridors`; factory lane scoring adds `run × 8` plus north progress, and an extra boost for `scout_next_lane_col` (lookahead corridor ahead of the factory).
 
-**Spawn safety:** `BUILD_*` only if spawn is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
+**Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
+
+**Build tunables (env-driven):** `choose_factory_build` reads its scoring constants from environment variables so they can be swept without editing source:
+
+- `CRAWL_SCOUT_CAP`, `CRAWL_WORKER_CAP`, `CRAWL_MINER_CAP`
+- `CRAWL_SCOUT_BASE`, `CRAWL_SCOUT_FEWER_THAN_TWO_BONUS`, `CRAWL_SCOUT_EARLY_BONUS`, `CRAWL_SCOUT_EARLY_STEP`, `CRAWL_SCOUT_ENEMY_PRESSURE_BONUS`, `CRAWL_SCOUT_NO_WORKER_PENALTY`
+- `CRAWL_WORKER_BASE`, `CRAWL_WORKER_FIRST_STEP`, `CRAWL_WORKER_FIRST_BONUS`, `CRAWL_WORKER_ENEMY_SCOUT_BONUS`, `CRAWL_WORKER_ENEMY_WORKER_BONUS`, `CRAWL_WORKER_NO_WORKER_BONUS`
+- `CRAWL_MINER_BASE`, `CRAWL_MINER_ENEMY_MINE_PENALTY`, `CRAWL_MINER_ENEMY_WORKER_BONUS`, `CRAWL_MINER_FIRST_BONUS`, `CRAWL_MINER_LATE_FIRST_STEP`, `CRAWL_MINER_LATE_FIRST_BONUS`
+
+`experiment_build_order.py` provides preset sweeps and a `--custom` mode; defaults match v18 behavior.
 
 ## Scout (type 1)
 
@@ -108,4 +117,8 @@ The factory does not hunt crystals or refuel.
 ## Testing
 
 - `python3 test.py` — single seeded game vs the built-in random bot.
-- `python3 benchmark.py` — seeds 1–10 vs `random` and a stronger greedy opponent.
+- `python3 benchmark.py` — default seeds 1–10 vs `random` and a stronger greedy opponent.
+- `python3 benchmark.py --seeds 1 2 3 --opponents greedy` — restrict seeds and opponents.
+- `python3 benchmark.py --replay 4 --replay-every 5` — per-step factory/robot dump for one seed (use to diagnose losses).
+- `python3 experiment_lane_margin.py` — sweep `LANE_SWITCH_MARGIN`.
+- `python3 experiment_build_order.py --preset all --seeds $(seq 1 30) --opponents random` — sweep build-order constants vs a 30-seed baseline.

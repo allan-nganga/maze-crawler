@@ -19,6 +19,37 @@ ENEMY_MEMORY_TURNS = 8
 SCOUT_CORRIDOR_MEMORY_TURNS = 8
 SCOUT_CORRIDOR_MIN_RUN = 3
 SCOUT_CORRIDOR_LANE_BONUS = 8
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# choose_factory_build tunables. Override via env for sweeps (see experiment_build_order.py).
+SCOUT_CAP = _env_int("CRAWL_SCOUT_CAP", 4)
+WORKER_CAP = _env_int("CRAWL_WORKER_CAP", 2)
+MINER_CAP = _env_int("CRAWL_MINER_CAP", 2)
+SCOUT_BASE_SCORE = _env_int("CRAWL_SCOUT_BASE", 5)
+SCOUT_FEWER_THAN_TWO_BONUS = _env_int("CRAWL_SCOUT_FEWER_THAN_TWO_BONUS", 8)
+SCOUT_EARLY_BONUS = _env_int("CRAWL_SCOUT_EARLY_BONUS", 4)
+SCOUT_EARLY_STEP = _env_int("CRAWL_SCOUT_EARLY_STEP", 60)
+SCOUT_ENEMY_PRESSURE_BONUS = _env_int("CRAWL_SCOUT_ENEMY_PRESSURE_BONUS", 3)
+SCOUT_NO_WORKER_PENALTY = _env_int("CRAWL_SCOUT_NO_WORKER_PENALTY", 6)
+WORKER_BASE_SCORE = _env_int("CRAWL_WORKER_BASE", 3)
+WORKER_FIRST_STEP = _env_int("CRAWL_WORKER_FIRST_STEP", 25)
+WORKER_FIRST_BONUS = _env_int("CRAWL_WORKER_FIRST_BONUS", 4)
+WORKER_ENEMY_SCOUT_BONUS = _env_int("CRAWL_WORKER_ENEMY_SCOUT_BONUS", 6)
+WORKER_ENEMY_WORKER_BONUS = _env_int("CRAWL_WORKER_ENEMY_WORKER_BONUS", 3)
+WORKER_NO_WORKER_BONUS = _env_int("CRAWL_WORKER_NO_WORKER_BONUS", 10)
+MINER_BASE_SCORE = _env_int("CRAWL_MINER_BASE", 7)
+MINER_ENEMY_MINE_PENALTY = _env_int("CRAWL_MINER_ENEMY_MINE_PENALTY", 3)
+MINER_ENEMY_WORKER_BONUS = _env_int("CRAWL_MINER_ENEMY_WORKER_BONUS", 2)
+MINER_FIRST_BONUS = _env_int("CRAWL_MINER_FIRST_BONUS", 4)
+MINER_LATE_FIRST_STEP = _env_int("CRAWL_MINER_LATE_FIRST_STEP", 90)
+MINER_LATE_FIRST_BONUS = _env_int("CRAWL_MINER_LATE_FIRST_BONUS", 0)
 ENDGAME_NO_BUILD_STEP = 380
 LANE_REEVAL_INTERVAL = 8
 # Require strictly more than this gap vs current lane to switch (ties always keep current).
@@ -547,6 +578,8 @@ def factory_spawn_is_safe(
         return False
     if wall_value(spawn_col, spawn_row, obs, config) in (None, -1):
         return False
+    if not can_move_known(col, row, "NORTH", obs, config):
+        return False
 
     crystal_e = crystal_energy_at(spawn_col, spawn_row, obs)
     if crystal_e is not None and crystal_e >= 5:
@@ -805,48 +838,49 @@ def choose_factory_build(
         return "BUILD_SCOUT"
 
     def scout_score():
-        s = 5
+        s = SCOUT_BASE_SCORE
         if scouts < 2:
-            s += 8
-        if step < 60 and not remembered_nodes:
-            s += 4
+            s += SCOUT_FEWER_THAN_TWO_BONUS
+        if step < SCOUT_EARLY_STEP and not remembered_nodes:
+            s += SCOUT_EARLY_BONUS
         if enemy_count[1] >= 3:
-            s += 3
+            s += SCOUT_ENEMY_PRESSURE_BONUS
         if scouts >= 2 and workers == 0:
-            s -= 6
+            s -= SCOUT_NO_WORKER_PENALTY
         return s
 
     def worker_score():
-        s = 3
+        s = WORKER_BASE_SCORE
         if enemy_count[1] >= 2:
-            s += 6
-        if workers == 0 and step > 25:
-            s += 4
-        if enemy_count[2] >= 1 and workers < 2:
-            s += 3
+            s += WORKER_ENEMY_SCOUT_BONUS
+        if workers == 0 and step > WORKER_FIRST_STEP:
+            s += WORKER_FIRST_BONUS
+        if enemy_count[2] >= 1 and workers < WORKER_CAP:
+            s += WORKER_ENEMY_WORKER_BONUS
         if scouts >= 2 and workers == 0:
-            s += 10
+            s += WORKER_NO_WORKER_BONUS
         return s
 
     def miner_score():
         if not remembered_nodes:
             return -1
-        s = 2
-        s += 5
+        s = MINER_BASE_SCORE
         if enemy_mines >= 1:
-            s -= 3
+            s -= MINER_ENEMY_MINE_PENALTY
         if enemy_count[2] >= 1:
-            s += 2
+            s += MINER_ENEMY_WORKER_BONUS
         if miners == 0:
-            s += 4
+            s += MINER_FIRST_BONUS
+        if miners == 0 and step >= MINER_LATE_FIRST_STEP:
+            s += MINER_LATE_FIRST_BONUS
         return s
 
     candidates = []
-    if energy >= config.scoutCost and scouts < 4:
+    if energy >= config.scoutCost and scouts < SCOUT_CAP:
         candidates.append(("BUILD_SCOUT", scout_score()))
-    if energy >= config.workerCost and workers < 2:
+    if energy >= config.workerCost and workers < WORKER_CAP:
         candidates.append(("BUILD_WORKER", worker_score()))
-    if energy >= config.minerCost and miners < 2 and remembered_nodes:
+    if energy >= config.minerCost and miners < MINER_CAP and remembered_nodes:
         ms = miner_score()
         if ms >= 0:
             candidates.append(("BUILD_MINER", ms))
