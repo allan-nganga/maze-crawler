@@ -10,6 +10,7 @@ scout_prev_cell = {}
 factory_lane_col = None
 factory_prev_col = None
 factory_last_horiz = None
+factory_last_row = None
 scout_corridors = {}
 scout_next_lane_col = None
 last_seen_step = -1
@@ -39,7 +40,7 @@ SCOUT_EARLY_STEP = _env_int("CRAWL_SCOUT_EARLY_STEP", 60)
 SCOUT_ENEMY_PRESSURE_BONUS = _env_int("CRAWL_SCOUT_ENEMY_PRESSURE_BONUS", 3)
 SCOUT_NO_WORKER_PENALTY = _env_int("CRAWL_SCOUT_NO_WORKER_PENALTY", 6)
 WORKER_BASE_SCORE = _env_int("CRAWL_WORKER_BASE", 3)
-WORKER_FIRST_STEP = _env_int("CRAWL_WORKER_FIRST_STEP", 25)
+WORKER_FIRST_STEP = _env_int("CRAWL_WORKER_FIRST_STEP", 8)
 WORKER_FIRST_BONUS = _env_int("CRAWL_WORKER_FIRST_BONUS", 4)
 WORKER_ENEMY_SCOUT_BONUS = _env_int("CRAWL_WORKER_ENEMY_SCOUT_BONUS", 6)
 WORKER_ENEMY_WORKER_BONUS = _env_int("CRAWL_WORKER_ENEMY_WORKER_BONUS", 3)
@@ -694,22 +695,26 @@ def choose_factory_blocked_move(
     can_lane_shift,
     factory_lane_col,
 ):
-    global factory_prev_col, factory_last_horiz
+    global factory_prev_col, factory_last_horiz, factory_last_row
 
     escape = factory_local_north_escape(
         col, row, can_go, obs, config, planned_targets
     )
-    if escape is not None:
+    row_stuck = factory_last_row == row and factory_prev_col == col
+    horiz_stuck = row_stuck and factory_last_horiz in ("EAST", "WEST")
+
+    if escape is not None and not horiz_stuck:
         dest = target_cell(col, row, escape)
         if dest not in planned_targets:
             return escape
 
-    oscillating = (
-        factory_prev_col == col
-        and factory_last_horiz in ("EAST", "WEST")
-        and north_run_length(col, row, obs, config) == 0
-    )
-    if oscillating and escape is not None:
+    if jump_cd == 0 and factory_jump_north_is_safe(
+        col, row, obs, config, occupied_by_me, planned_targets, urgent_scroll, can_go
+    ):
+        if urgent_scroll or horiz_stuck:
+            return "JUMP_NORTH"
+
+    if escape is not None:
         dest = target_cell(col, row, escape)
         if dest not in planned_targets:
             return escape
@@ -719,7 +724,7 @@ def choose_factory_blocked_move(
     ):
         return "JUMP_NORTH"
 
-    if can_lane_shift and lane_direction is not None:
+    if can_lane_shift and lane_direction is not None and not horiz_stuck:
         return lane_direction
 
     return deterministic_factory_sidestep(col, can_go, config, factory_lane_col)
@@ -824,7 +829,15 @@ def count_enemy_mines(obs):
 
 
 def choose_factory_build(
-    energy, config, counts, remembered_nodes, obs, enemy_count, enemy_mines
+    energy,
+    config,
+    counts,
+    remembered_nodes,
+    obs,
+    enemy_count,
+    enemy_mines,
+    factory_col,
+    factory_row,
 ):
     if obs.step > ENDGAME_NO_BUILD_STEP:
         return None
@@ -835,7 +848,14 @@ def choose_factory_build(
     step = obs.step
 
     if scouts == 0 and energy >= config.scoutCost:
-        return "BUILD_SCOUT"
+        if can_move_known(factory_col, factory_row, "NORTH", obs, config):
+            return "BUILD_SCOUT"
+
+    # One scout for vision, then prioritize worker before more scouts or miners.
+    if scouts >= 1 and workers == 0:
+        if energy >= config.workerCost:
+            return "BUILD_WORKER"
+        return None
 
     def scout_score():
         s = SCOUT_BASE_SCORE
@@ -1391,7 +1411,7 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
 
 def agent(obs, config):
     global last_seen_step, factory_lane_col, factory_prev_col, factory_last_horiz
-    global scout_corridors, scout_next_lane_col
+    global factory_last_row, scout_corridors, scout_next_lane_col
 
     if obs.step <= last_seen_step:
         remembered_mining_nodes.clear()
@@ -1403,6 +1423,7 @@ def agent(obs, config):
         factory_lane_col = None
         factory_prev_col = None
         factory_last_horiz = None
+        factory_last_row = None
     last_seen_step = obs.step
 
     actions = {}
@@ -1491,6 +1512,8 @@ def agent(obs, config):
                 obs,
                 enemy_count,
                 enemy_mines,
+                col,
+                row,
             )
             can_build = (
                 build_cd == 0
@@ -1504,7 +1527,7 @@ def agent(obs, config):
                 or (
                     robot_counts[2] == 0
                     and robot_counts[1] >= 1
-                    and obs.step > 25
+                    and obs.step >= WORKER_FIRST_STEP
                 )
                 or (
                     robot_counts[3] == 0
@@ -1530,6 +1553,11 @@ def agent(obs, config):
                 and is_row_scroll_safe(row, obs, config, turns_ahead=2, buffer_rows=3)
             )
             jump_cd = data[6]
+            needs_worker = (
+                robot_counts[2] == 0
+                and robot_counts[1] >= 1
+                and obs.step >= WORKER_FIRST_STEP
+            )
 
             if move_cd > 0:
                 actions[uid] = build_action if can_build else "IDLE"
@@ -1537,6 +1565,24 @@ def agent(obs, config):
                 actions[uid] = "NORTH"
             elif must_build:
                 actions[uid] = build_action
+            elif can_build and needs_worker:
+                actions[uid] = build_action
+            elif (
+                needs_worker
+                and not can_go["NORTH"]
+                and jump_cd == 0
+                and factory_jump_north_is_safe(
+                    col,
+                    row,
+                    obs,
+                    config,
+                    occupied_by_me,
+                    planned_targets,
+                    urgent_scroll,
+                    can_go,
+                )
+            ):
+                actions[uid] = "JUMP_NORTH"
             elif can_go["NORTH"]:
                 actions[uid] = "NORTH"
             elif can_build:
@@ -1560,9 +1606,11 @@ def agent(obs, config):
             if actions[uid] in ("EAST", "WEST"):
                 factory_last_horiz = actions[uid]
                 factory_prev_col = col
+                factory_last_row = row
             elif actions[uid] != "IDLE":
                 factory_last_horiz = None
                 factory_prev_col = col
+                factory_last_row = row
 
         elif rtype == 1:
             fuel, crystal_key = fuel_action(

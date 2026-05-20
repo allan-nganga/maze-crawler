@@ -50,6 +50,7 @@ The factory does not hunt crystals or refuel.
 **Build order** when spawn is safe, build cooldown is ready, scroll margin is greater than 2, and before step 380:
 
 - Always build at least one scout for vision.
+- After the first scout exists and **no worker** is on the map, the factory **only** attempts `BUILD_WORKER` (no second scout until a worker exists).
 - Among affordable builds (scout up to 4 total, up to 2 workers, up to 2 miners when nodes are remembered), pick the action with the highest **score** from enemy-informed heuristics:
   - **Scouts:** boosted early and when no mining nodes are remembered yet; extra boost if many enemy scouts were seen.
   - **Workers:** boosted when the enemy has two or more scouts (crush), when we have no worker after step 25, or when an enemy worker is known.
