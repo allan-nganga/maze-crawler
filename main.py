@@ -53,6 +53,9 @@ MINER_LATE_FIRST_STEP = _env_int("CRAWL_MINER_LATE_FIRST_STEP", 90)
 MINER_LATE_FIRST_BONUS = _env_int("CRAWL_MINER_LATE_FIRST_BONUS", 0)
 ENDGAME_NO_BUILD_STEP = 380
 LANE_REEVAL_INTERVAL = 8
+# Factory must not sidestep when this close to the scroll line (see choose_factory_blocked_move).
+SCROLL_CRITICAL_MARGIN = 3
+FACTORY_SCROLL_PANIC_TURNS = 4
 # Require strictly more than this gap vs current lane to switch (ties always keep current).
 # Override: CRAWL_LANE_SWITCH_MARGIN=2 python3 benchmark.py  (see experiment_lane_margin.py)
 LANE_SWITCH_MARGIN = max(
@@ -694,24 +697,28 @@ def choose_factory_blocked_move(
     lane_direction,
     can_lane_shift,
     factory_lane_col,
+    scroll_margin,
 ):
     global factory_prev_col, factory_last_horiz, factory_last_row
+
+    critical_scroll = scroll_margin <= SCROLL_CRITICAL_MARGIN
 
     escape = factory_local_north_escape(
         col, row, can_go, obs, config, planned_targets
     )
     row_stuck = factory_last_row == row and factory_prev_col == col
     horiz_stuck = row_stuck and factory_last_horiz in ("EAST", "WEST")
+    panic = urgent_scroll or critical_scroll
 
-    if escape is not None and not horiz_stuck:
+    if escape is not None and (not horiz_stuck or panic):
         dest = target_cell(col, row, escape)
         if dest not in planned_targets:
             return escape
 
     if jump_cd == 0 and factory_jump_north_is_safe(
-        col, row, obs, config, occupied_by_me, planned_targets, urgent_scroll, can_go
+        col, row, obs, config, occupied_by_me, planned_targets, True, can_go
     ):
-        if urgent_scroll or horiz_stuck:
+        if panic or horiz_stuck:
             return "JUMP_NORTH"
 
     if escape is not None:
@@ -720,14 +727,19 @@ def choose_factory_blocked_move(
             return escape
 
     if jump_cd == 0 and factory_jump_north_is_safe(
-        col, row, obs, config, occupied_by_me, planned_targets, urgent_scroll, can_go
+        col, row, obs, config, occupied_by_me, planned_targets, panic, can_go
     ):
         return "JUMP_NORTH"
 
-    if can_lane_shift and lane_direction is not None and not horiz_stuck:
-        return lane_direction
+    if can_go.get("NORTH") and panic:
+        return "NORTH"
 
-    return deterministic_factory_sidestep(col, can_go, config, factory_lane_col)
+    if not critical_scroll:
+        if can_lane_shift and lane_direction is not None and not horiz_stuck:
+            return lane_direction
+        return deterministic_factory_sidestep(col, can_go, config, factory_lane_col)
+
+    return "IDLE"
 
 
 def step_toward(
@@ -1191,6 +1203,61 @@ def find_my_factory(my_robots):
     return None
 
 
+def friendly_blocking_cells(my_robots, exclude_uid=None):
+    """Positions of friendly units scouts must not enter (factory crush, stacking)."""
+    cells = set()
+    for uid, data in my_robots.items():
+        if uid == exclude_uid:
+            continue
+        cells.add(f"{data[1]},{data[2]}")
+    return cells
+
+
+def scout_on_factory_spawn(col, row, my_robots):
+    factory = find_my_factory(my_robots)
+    if factory is None:
+        return False
+    return col == factory[1] and row == factory[2] + 1
+
+
+def filter_scout_directions(col, row, directions, blocking_cells, planned_targets):
+    safe = []
+    for direction in directions:
+        dest = target_cell(col, row, direction)
+        if dest in blocking_cells or dest in planned_targets:
+            continue
+        safe.append(direction)
+    return safe
+
+
+def scout_safe_move_action(
+    col, row, proposed, can_go, blocking_cells, planned_targets, config, prefer_north=True
+):
+    """Reject moves onto friendly cells; pick a legal alternative."""
+    if proposed in (None, "IDLE") or not isinstance(proposed, str):
+        return proposed or "IDLE"
+    if proposed.startswith(("BUILD_", "TRANSFER_", "REMOVE_", "JUMP_", "TRANSFORM")):
+        return proposed
+
+    dest = target_cell(col, row, proposed)
+    if dest not in blocking_cells and dest not in planned_targets:
+        return proposed
+
+    pool = filter_scout_directions(
+        col, row, [d for d in DIR_ORDER if can_go[d]], blocking_cells, planned_targets
+    )
+    return deterministic_pick_dir(col, pool, config, prefer_north=prefer_north) or "IDLE"
+
+
+def scout_spawn_action(col, row, can_go, blocking_cells, planned_targets, config):
+    """First move from the factory spawn tile: never step south onto the factory."""
+    dirs = [d for d in ("NORTH", "EAST", "WEST") if can_go[d]]
+    pool = filter_scout_directions(col, row, dirs, blocking_cells, planned_targets)
+    if "NORTH" in pool:
+        return "NORTH"
+    return deterministic_pick_dir(col, pool, config, prefer_north=True) or "IDLE"
+
+
 def worker_return_to_factory_action(
     col, row, energy, config, my_robots, can_go, planned_targets, obs
 ):
@@ -1378,8 +1445,12 @@ def fuel_action(
     return None, None
 
 
-def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
-    options = [d for d in DIR_ORDER if can_go[d]]
+def scout_explore_action(
+    col, row, can_go, planned_targets, uid, obs, config, blocking_cells
+):
+    options = filter_scout_directions(
+        col, row, [d for d in DIR_ORDER if can_go[d]], blocking_cells, planned_targets
+    )
     if not options:
         return "IDLE"
 
@@ -1390,21 +1461,17 @@ def scout_explore_action(col, row, can_go, planned_targets, uid, obs, config):
     frontier_action = bfs_first_step_to_frontier(
         col, row, can_go, obs, config, planned_targets, prev_key
     )
-    if (
-        frontier_action is not None
-        and target_cell(col, row, frontier_action) not in planned_targets
-    ):
-        return frontier_action
+    if frontier_action is not None:
+        dest = target_cell(col, row, frontier_action)
+        if dest not in planned_targets and dest not in blocking_cells:
+            return frontier_action
 
     safe = [
         d
         for d in options
-        if target_cell(col, row, d) not in planned_targets
-        and target_cell(col, row, d) != prev_key
+        if target_cell(col, row, d) != prev_key
     ]
-    pool = safe if safe else [d for d in options if target_cell(col, row, d) not in planned_targets]
-    if not pool:
-        pool = options
+    pool = safe if safe else options
 
     return deterministic_pick_dir(col, pool, config, prefer_north=True) or "IDLE"
 
@@ -1493,8 +1560,9 @@ def agent(obs, config):
 
         if rtype == 0:
             scroll_margin = row - obs.southBound
-            urgent_scroll = not is_row_scroll_safe(
-                row, obs, config, turns_ahead=4, buffer_rows=2
+            critical_scroll = scroll_margin <= SCROLL_CRITICAL_MARGIN
+            urgent_scroll = critical_scroll or not is_row_scroll_safe(
+                row, obs, config, turns_ahead=FACTORY_SCROLL_PANIC_TURNS, buffer_rows=2
             )
             spawn_is_safe = factory_spawn_is_safe(
                 col, row, obs, config, occupied_by_me, planned_targets, my_robots
@@ -1549,6 +1617,7 @@ def agent(obs, config):
                 lane_direction is not None
                 and not can_go["NORTH"]
                 and not urgent_scroll
+                and not critical_scroll
                 and scroll_margin >= 8
                 and is_row_scroll_safe(row, obs, config, turns_ahead=2, buffer_rows=3)
             )
@@ -1561,6 +1630,17 @@ def agent(obs, config):
 
             if move_cd > 0:
                 actions[uid] = build_action if can_build else "IDLE"
+            elif critical_scroll and jump_cd == 0 and factory_jump_north_is_safe(
+                col,
+                row,
+                obs,
+                config,
+                occupied_by_me,
+                planned_targets,
+                True,
+                can_go,
+            ):
+                actions[uid] = "JUMP_NORTH"
             elif urgent_scroll and can_go["NORTH"]:
                 actions[uid] = "NORTH"
             elif must_build:
@@ -1601,6 +1681,7 @@ def agent(obs, config):
                     lane_direction,
                     can_lane_shift,
                     factory_lane_col,
+                    scroll_margin,
                 )
 
             if actions[uid] in ("EAST", "WEST"):
@@ -1613,26 +1694,49 @@ def agent(obs, config):
                 factory_last_row = row
 
         elif rtype == 1:
-            fuel, crystal_key = fuel_action(
-                uid,
+            scout_blocking = friendly_blocking_cells(my_robots, exclude_uid=uid)
+            if scout_on_factory_spawn(col, row, my_robots):
+                actions[uid] = scout_spawn_action(
+                    col, row, can_go, scout_blocking, planned_targets, config
+                )
+            else:
+                fuel, crystal_key = fuel_action(
+                    uid,
+                    col,
+                    row,
+                    rtype,
+                    energy,
+                    obs,
+                    config,
+                    can_go,
+                    planned_targets,
+                    planned_crystal_claims,
+                    assigned_crystals,
+                    my_robots,
+                )
+                if fuel is not None:
+                    actions[uid] = fuel
+                else:
+                    actions[uid] = scout_explore_action(
+                        col,
+                        row,
+                        can_go,
+                        planned_targets,
+                        uid,
+                        obs,
+                        config,
+                        scout_blocking,
+                    )
+            actions[uid] = scout_safe_move_action(
                 col,
                 row,
-                rtype,
-                energy,
-                obs,
-                config,
+                actions[uid],
                 can_go,
+                scout_blocking,
                 planned_targets,
-                planned_crystal_claims,
-                assigned_crystals,
-                my_robots,
+                config,
+                prefer_north=True,
             )
-            if fuel is not None:
-                actions[uid] = fuel
-            else:
-                actions[uid] = scout_explore_action(
-                    col, row, can_go, planned_targets, uid, obs, config
-                )
             scout_prev_cell[uid] = f"{col},{row}"
 
         elif rtype == 2:

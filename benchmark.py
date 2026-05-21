@@ -82,8 +82,13 @@ OPPONENTS = {
 }
 
 
+def _env_config(seed):
+    """Kaggle replays use ``seed``; local docs often use ``randomSeed``."""
+    return {"seed": seed, "randomSeed": seed}
+
+
 def run_match(seed, opponent, opponent_name):
-    env = make("crawl", configuration={"randomSeed": seed}, debug=False)
+    env = make("crawl", configuration=_env_config(seed), debug=False)
     env.run([agent, opponent])
     final = env.steps[-1]
     my_reward = final[0].reward
@@ -126,7 +131,7 @@ def _state_to_obj(state):
 def replay_match(seed, opponent_name, every_n=1):
     """Run a match and print a per-turn dump of factory + robot state."""
     opponent = OPPONENTS[opponent_name]
-    env = make("crawl", configuration={"randomSeed": seed}, debug=False)
+    env = make("crawl", configuration=_env_config(seed), debug=False)
     env.run([agent, opponent])
 
     print(f"# replay seed={seed} opponent={opponent_name} steps={len(env.steps)}")
