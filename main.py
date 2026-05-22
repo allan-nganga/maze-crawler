@@ -61,6 +61,18 @@ FACTORY_SCROLL_PANIC_TURNS = 4
 LANE_SWITCH_MARGIN = max(
     0, int(os.environ.get("CRAWL_LANE_SWITCH_MARGIN", "8"))
 )
+# Dijkstra edge costs (destination_move_cost). Sweep via experiment or env.
+PATH_EDGE_BASE = _env_int("CRAWL_PATH_BASE", 2)
+PATH_NORTH_EDGE = _env_int("CRAWL_NORTH_EDGE", 1)
+PATH_HORIZ_EXTRA = _env_int("CRAWL_HORIZ_EDGE", 2)
+PATH_SOUTH_EXTRA = _env_int("CRAWL_SOUTH_EDGE", 3)
+# Scout explore (phase 2): corridor-march before frontier BFS.
+SCOUT_EXPLORE_SCROLL_MARGIN = _env_int("CRAWL_SCOUT_EXPLORE_SCROLL_MARGIN", 6)
+SCOUT_NORTH_PROBE_MIN_RUN = _env_int("CRAWL_SCOUT_NORTH_PROBE_RUN", 2)
+# Weighted known-map search limits (factory escape, frontier, goal fallback).
+FACTORY_ESCAPE_MAX_COST = _env_int("CRAWL_FACTORY_ESCAPE_MAX_COST", 18)
+FRONTIER_MAX_COST = _env_int("CRAWL_FRONTIER_MAX_COST", 48)
+WEIGHTED_TARGET_MAX_COST = _env_int("CRAWL_WEIGHTED_TARGET_MAX_COST", 60)
 INVALID_UTILITY = -10**6
 INF_PATH_COST = 10**9
 DIR_ORDER = ["NORTH", "EAST", "WEST", "SOUTH"]
@@ -235,9 +247,15 @@ def destination_move_cost(to_col, to_row, direction, arrival_turns, ctx):
             if outcome in ("lose", "both"):
                 return INF_PATH_COST
 
-    w = 2
-    if direction == "SOUTH":
-        w += 3
+    if direction == "NORTH":
+        w = PATH_NORTH_EDGE
+    elif direction == "SOUTH":
+        w = PATH_EDGE_BASE + PATH_SOUTH_EXTRA
+    elif direction in ("EAST", "WEST"):
+        w = PATH_EDGE_BASE + PATH_HORIZ_EXTRA
+    else:
+        w = PATH_EDGE_BASE
+
     if pos_key in ctx["planned"]:
         w += 5
 
@@ -325,6 +343,137 @@ def dijkstra_first_step_to_target(start_col, start_row, goal_col, goal_row, obs,
     if goal not in parent:
         return None
     return first_step_from_parent(start, goal, parent)
+
+
+def spatial_step_cost(direction, allow_south=False):
+    """Edge cost for known-map weighted search (uses PATH_* tunables)."""
+    if direction == "SOUTH" and not allow_south:
+        return INF_PATH_COST
+    if direction == "NORTH":
+        return PATH_NORTH_EDGE
+    if direction in ("EAST", "WEST"):
+        return PATH_EDGE_BASE + PATH_HORIZ_EXTRA
+    if direction == "SOUTH":
+        return PATH_EDGE_BASE + PATH_SOUTH_EXTRA
+    return PATH_EDGE_BASE
+
+
+def weighted_search_first_step(
+    start_col,
+    start_row,
+    obs,
+    config,
+    is_goal_fn,
+    max_cost,
+    planned_targets=None,
+    neighbor_dirs=None,
+    allow_south=False,
+    scroll_buffer=1,
+):
+    """Dijkstra on known walls; returns first step toward a minimum-cost goal cell."""
+    if neighbor_dirs is None:
+        neighbor_dirs = ("NORTH", "EAST", "WEST", "SOUTH")
+
+    start = (start_col, start_row)
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return None
+    if is_goal_fn(start_col, start_row):
+        return None
+
+    dist = {start: 0}
+    first_step = {}
+    tie = 0
+    heap = [(0, tie, start_col, start_row)]
+
+    while heap:
+        cost, _, col, row = heapq.heappop(heap)
+        state = (col, row)
+        if cost > dist.get(state, INF_PATH_COST):
+            continue
+        if is_goal_fn(col, row):
+            return first_step.get(state)
+
+        for direction in neighbor_dirs:
+            if not can_move_known(col, row, direction, obs, config):
+                continue
+            step_w = spatial_step_cost(direction, allow_south=allow_south)
+            if step_w >= INF_PATH_COST:
+                continue
+            nc, nr = next_cell(col, row, direction)
+            nstate = (nc, nr)
+            if not is_row_scroll_safe(
+                nr, obs, config, turns_ahead=0, buffer_rows=scroll_buffer
+            ):
+                continue
+            nkey = f"{nc},{nr}"
+            if state == start and planned_targets and nkey in planned_targets:
+                continue
+            new_cost = cost + step_w
+            if new_cost > max_cost:
+                continue
+            if new_cost < dist.get(nstate, INF_PATH_COST):
+                dist[nstate] = new_cost
+                first_step[nstate] = (
+                    direction if state == start else first_step[state]
+                )
+                tie += 1
+                heapq.heappush(heap, (new_cost, tie, nc, nr))
+
+    return None
+
+
+def weighted_first_step_to_target(
+    start_col, start_row, goal_col, goal_row, obs, config, planned_targets=None
+):
+    if (start_col, start_row) == (goal_col, goal_row):
+        return "IDLE"
+    if wall_value(goal_col, goal_row, obs, config) in (None, -1):
+        return None
+
+    goal = (goal_col, goal_row)
+
+    def is_goal(c, r):
+        return (c, r) == goal
+
+    return weighted_search_first_step(
+        start_col,
+        start_row,
+        obs,
+        config,
+        is_goal,
+        WEIGHTED_TARGET_MAX_COST,
+        planned_targets=planned_targets,
+        neighbor_dirs=DIR_ORDER,
+        allow_south=True,
+        scroll_buffer=1,
+    )
+
+
+def weighted_first_step_to_frontier(
+    start_col, start_row, can_go, obs, config, planned_targets, prev_key
+):
+    if wall_value(start_col, start_row, obs, config) in (None, -1):
+        return None
+    if is_frontier_cell(start_col, start_row, obs, config):
+        return frontier_opening_action(
+            start_col, start_row, can_go, obs, config, planned_targets, prev_key
+        )
+
+    def is_goal(c, r):
+        return is_frontier_cell(c, r, obs, config)
+
+    return weighted_search_first_step(
+        start_col,
+        start_row,
+        obs,
+        config,
+        is_goal,
+        FRONTIER_MAX_COST,
+        planned_targets=planned_targets,
+        neighbor_dirs=("NORTH", "EAST", "WEST"),
+        allow_south=False,
+        scroll_buffer=1,
+    )
 
 
 def is_frontier_cell(col, row, obs, config):
@@ -626,45 +775,32 @@ def factory_jump_north_is_safe(
 
 
 def factory_local_north_escape(col, row, can_go, obs, config, planned_targets, max_depth=6):
-    """BFS for a short path to a cell from which north is open (known walls)."""
-    start = (col, row)
+    """Weighted search for a cheap path to a cell with a known-open north edge."""
     if wall_value(col, row, obs, config) in (None, -1):
         return None
+    if can_move_known(col, row, "NORTH", obs, config):
+        return "NORTH" if can_go.get("NORTH") else None
 
-    queue = deque([(start, 0)])
-    visited = {start}
-    first_step = {}
+    max_cost = min(
+        FACTORY_ESCAPE_MAX_COST,
+        max(PATH_NORTH_EDGE, PATH_EDGE_BASE + PATH_HORIZ_EXTRA) * max(1, max_depth),
+    )
 
-    while queue:
-        (cur_col, cur_row), depth = queue.popleft()
-        if can_move_known(cur_col, cur_row, "NORTH", obs, config):
-            if (cur_col, cur_row) == start:
-                return "NORTH" if can_go.get("NORTH") else None
-            return first_step.get((cur_col, cur_row))
+    def north_open(c, r):
+        return can_move_known(c, r, "NORTH", obs, config)
 
-        if depth >= max_depth:
-            continue
-
-        for direction in ("NORTH", "EAST", "WEST"):
-            if not can_move_known(cur_col, cur_row, direction, obs, config):
-                continue
-            next_col, next_row = next_cell(cur_col, cur_row, direction)
-            if not is_row_scroll_safe(next_row, obs, config, turns_ahead=0, buffer_rows=2):
-                continue
-            nstate = (next_col, next_row)
-            if nstate in visited:
-                continue
-            nkey = f"{next_col},{next_row}"
-            if (cur_col, cur_row) == start and nkey in planned_targets:
-                continue
-
-            visited.add(nstate)
-            first_step[nstate] = (
-                direction if (cur_col, cur_row) == start else first_step[(cur_col, cur_row)]
-            )
-            queue.append((nstate, depth + 1))
-
-    return None
+    return weighted_search_first_step(
+        col,
+        row,
+        obs,
+        config,
+        north_open,
+        max_cost,
+        planned_targets=planned_targets,
+        neighbor_dirs=("NORTH", "EAST", "WEST"),
+        allow_south=False,
+        scroll_buffer=2,
+    )
 
 
 def deterministic_factory_sidestep(col, can_go, config, lane_col=None):
@@ -758,6 +894,12 @@ def step_toward(
     ctx = build_path_ctx(obs, config, rtype, intent, planned_targets, hungry)
     action = dijkstra_first_step_to_target(
         col, row, target_col, target_row, obs, config, ctx
+    )
+    if action is not None:
+        return action
+
+    action = weighted_first_step_to_target(
+        col, row, target_col, target_row, obs, config, planned_targets
     )
     if action is not None:
         return action
@@ -1445,6 +1587,72 @@ def fuel_action(
     return None, None
 
 
+def scout_corridor_entry_fresh(col, step):
+    entry = scout_corridors.get(col)
+    if entry is None:
+        return None
+    if step - entry["step"] > SCOUT_CORRIDOR_MEMORY_TURNS:
+        return None
+    return entry
+
+
+def scout_north_step_ok(col, row, can_go, blocking_cells, planned_targets, obs, config):
+    if not can_go.get("NORTH"):
+        return False
+    dest = target_cell(col, row, "NORTH")
+    if dest in blocking_cells or dest in planned_targets:
+        return False
+    _, nrow = next_cell(col, row, "NORTH")
+    return is_row_scroll_safe(nrow, obs, config, turns_ahead=0, buffer_rows=1)
+
+
+def scout_explore_scroll_panic(
+    col, row, can_go, blocking_cells, planned_targets, obs, config
+):
+    """Near the scroll line: only north or idle (no sideways frontier detours)."""
+    if scout_north_step_ok(col, row, can_go, blocking_cells, planned_targets, obs, config):
+        return "NORTH"
+    return "IDLE"
+
+
+def scout_explore_corridor_march(
+    col, row, can_go, blocking_cells, planned_targets, obs, config, step
+):
+    entry = scout_corridor_entry_fresh(col, step)
+    if entry is None or entry["run"] < SCOUT_CORRIDOR_MIN_RUN:
+        return None
+    if scout_north_step_ok(col, row, can_go, blocking_cells, planned_targets, obs, config):
+        return "NORTH"
+    return None
+
+
+def scout_explore_lane_steer(
+    col, row, lane_col, can_go, blocking_cells, planned_targets, obs, config
+):
+    if lane_col is None or lane_col == col:
+        return None
+    direction = "EAST" if lane_col > col else "WEST"
+    if direction not in can_go or not can_go[direction]:
+        return None
+    dest = target_cell(col, row, direction)
+    if dest in blocking_cells or dest in planned_targets:
+        return None
+    _, nrow = next_cell(col, row, direction)
+    if not is_row_scroll_safe(nrow, obs, config, turns_ahead=0, buffer_rows=1):
+        return None
+    return direction
+
+
+def scout_explore_north_probe(
+    col, row, can_go, blocking_cells, planned_targets, obs, config
+):
+    if north_run_length(col, row, obs, config) < SCOUT_NORTH_PROBE_MIN_RUN:
+        return None
+    if scout_north_step_ok(col, row, can_go, blocking_cells, planned_targets, obs, config):
+        return "NORTH"
+    return None
+
+
 def scout_explore_action(
     col, row, can_go, planned_targets, uid, obs, config, blocking_cells
 ):
@@ -1457,10 +1665,45 @@ def scout_explore_action(
     if len(options) == 1:
         return options[0]
 
+    if row - obs.southBound <= SCOUT_EXPLORE_SCROLL_MARGIN:
+        return scout_explore_scroll_panic(
+            col, row, can_go, blocking_cells, planned_targets, obs, config
+        )
+
+    march = scout_explore_corridor_march(
+        col, row, can_go, blocking_cells, planned_targets, obs, config, obs.step
+    )
+    if march is not None:
+        return march
+
+    if scout_next_lane_col is not None:
+        steer = scout_explore_lane_steer(
+            col,
+            row,
+            scout_next_lane_col,
+            can_go,
+            blocking_cells,
+            planned_targets,
+            obs,
+            config,
+        )
+        if steer is not None:
+            return steer
+
+    probe = scout_explore_north_probe(
+        col, row, can_go, blocking_cells, planned_targets, obs, config
+    )
+    if probe is not None:
+        return probe
+
     prev_key = scout_prev_cell.get(uid)
-    frontier_action = bfs_first_step_to_frontier(
+    frontier_action = weighted_first_step_to_frontier(
         col, row, can_go, obs, config, planned_targets, prev_key
     )
+    if frontier_action is None:
+        frontier_action = bfs_first_step_to_frontier(
+            col, row, can_go, obs, config, planned_targets, prev_key
+        )
     if frontier_action is not None:
         dest = target_cell(col, row, frontier_action)
         if dest not in planned_targets and dest not in blocking_cells:

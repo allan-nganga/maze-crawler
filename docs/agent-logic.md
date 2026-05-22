@@ -18,8 +18,8 @@ State resets when `obs.step` does not increase (a new game).
 ## Shared helpers
 
 - **Walls:** `obs.walls` index is `(row - southBound) * width + col`. Bits N=1, E=2, S=4, W=8.
-- **Known-wall BFS:** goal pathing uses BFS over discovered cells (`obs.walls != -1`) instead of greedy axis steps, so units route around known wall mazes with fewer wasted moves.
-- **Weighted pathing (Dijkstra):** goal-directed moves (`step_toward`, crystal assignment distances, refuel `move_toward_goal`) use Dijkstra on the known graph with non-negative edge costs: base step cost, south penalty, same-turn collision targets, scroll projection by move count × move period, crush-illegal destinations as blocked, and cheap edges onto friendly mines when refueling while hungry. If Dijkstra finds no path, behavior falls back to unit-cost BFS then greedy axis moves.
+- **Known-wall weighted search:** `spatial_step_cost` / `weighted_search_first_step` share the `CRAWL_*_EDGE` tunables on discovered cells (`obs.walls != -1`). Used for factory north-escape (`CRAWL_FACTORY_ESCAPE_MAX_COST`), scout frontier reach (`CRAWL_FRONTIER_MAX_COST`, north-biased, no south), and as a fallback in `step_toward` before unweighted BFS.
+- **Weighted pathing (Dijkstra):** goal-directed moves (`step_toward`, crystal assignment distances, refuel `move_toward_goal`) use full Dijkstra with collision/scroll/crush costs. Order: Dijkstra → weighted known-map goal search (`CRAWL_WEIGHTED_TARGET_MAX_COST`) → hop-count BFS → greedy axis moves.
 - **Scroll projection:** future `southBound` is projected from `scrollCounter` and config intervals to avoid actions that leave the factory too close to the rising floor.
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
 - **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using Dijkstra edge-count distances on the known map + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
@@ -61,7 +61,7 @@ The factory does not hunt crystals or refuel.
 
 - If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
 - When **north is open**, always **`NORTH`** first (collects crystals on the north cell; does not build or lane-shift while north is passable).
-- When **north is blocked**: try a short **BFS north-escape** (N/E/W only, scroll-safe rows) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
+- When **north is blocked**: try a **weighted north-escape** (N/E/W only, scroll-safe rows, prefers fewer/cheaper horizontal steps) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
 - Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`). Lane BFS scores get a **scout corridor bonus**: each turn scouts with `north_run_length ≥ 3` on known tiles update `scout_corridors`; factory lane scoring adds `run × 8` plus north progress, and an extra boost for `scout_next_lane_col` (lookahead corridor ahead of the factory).
 
 **Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
@@ -84,12 +84,15 @@ The factory does not hunt crystals or refuel.
 - Otherwise score visible and remembered crystals; move toward the best unclaimed target using weighted Dijkstra (edge costs above) with Hungarian-assigned goals when applicable.
 - If still hungry, path to the nearest friendly mine that is not south of the scout.
 
-**Exploration** when not refueling:
+**Exploration** when not refueling (in order):
 
 - If only one direction is open, take it (reverse out of a dead end).
-- Scouts run a frontier search: BFS to the nearest known cell adjacent to unknown space, then push into that opening.
-- If no frontier path exists, prefer north and avoid the previous cell and cells already claimed by another friendly this turn.
-- While exploring, scouts with a clear north runway (`north_run_length ≥ 3`) report that column into **`scout_corridors`** so the factory can bias its committed lane toward scout-discovered paths.
+- Within **`CRAWL_SCOUT_EXPLORE_SCROLL_MARGIN`** rows (default 6) of `southBound`: only **`NORTH`** or **`IDLE`** (no sideways frontier detours).
+- **Corridor march:** if this column has a fresh **`scout_corridors`** entry with `run ≥ 3`, step **`NORTH`** when scroll-safe.
+- **Lane steer:** one scroll-safe **`EAST`/`WEST`** step toward **`scout_next_lane_col`** (best corridor ahead of the factory); on that column, march north if possible.
+- **North probe:** if local `north_run_length ≥ CRAWL_SCOUT_NORTH_PROBE_RUN` (default 2), step **`NORTH`**.
+- Else **weighted frontier search** (north-biased costs, no south) to the cheapest reachable fog-adjacent cell, then unweighted frontier BFS fallback, then deterministic north-biased fallback (avoid previous cell / friendly blocks).
+- While exploring, scouts with `north_run_length ≥ 3` update **`scout_corridors`** so the factory lane scorer can commit to scout-discovered paths.
 
 ## Worker (type 2)
 
