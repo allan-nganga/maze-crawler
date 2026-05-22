@@ -51,6 +51,10 @@ MINER_ENEMY_WORKER_BONUS = _env_int("CRAWL_MINER_ENEMY_WORKER_BONUS", 2)
 MINER_FIRST_BONUS = _env_int("CRAWL_MINER_FIRST_BONUS", 4)
 MINER_LATE_FIRST_STEP = _env_int("CRAWL_MINER_LATE_FIRST_STEP", 90)
 MINER_LATE_FIRST_BONUS = _env_int("CRAWL_MINER_LATE_FIRST_BONUS", 0)
+MINER_ENEMY_MINER_BONUS = _env_int("CRAWL_MINER_ENEMY_MINER_BONUS", 14)
+MINER_RUSH_STEP = _env_int("CRAWL_MINER_RUSH_STEP", 80)
+MINER_OPENER_STEP = _env_int("CRAWL_MINER_OPENER_STEP", 25)
+MINER_OPENER_MAX_HOPS = _env_int("CRAWL_MINER_OPENER_DIST", 2)
 ENDGAME_NO_BUILD_STEP = 380
 LANE_REEVAL_INTERVAL = 8
 # Factory must not sidestep when this close to the scroll line (see choose_factory_blocked_move).
@@ -61,10 +65,10 @@ FACTORY_SCROLL_PANIC_TURNS = 4
 LANE_SWITCH_MARGIN = max(
     0, int(os.environ.get("CRAWL_LANE_SWITCH_MARGIN", "8"))
 )
-# Dijkstra edge costs (destination_move_cost). Sweep via experiment or env.
+# Dijkstra edge costs (destination_move_cost). Defaults match v21 (N/EW=2, S=5); override to bias north.
 PATH_EDGE_BASE = _env_int("CRAWL_PATH_BASE", 2)
-PATH_NORTH_EDGE = _env_int("CRAWL_NORTH_EDGE", 1)
-PATH_HORIZ_EXTRA = _env_int("CRAWL_HORIZ_EDGE", 2)
+PATH_NORTH_EDGE = _env_int("CRAWL_NORTH_EDGE", 2)
+PATH_HORIZ_EXTRA = _env_int("CRAWL_HORIZ_EDGE", 0)
 PATH_SOUTH_EXTRA = _env_int("CRAWL_SOUTH_EDGE", 3)
 # Scout explore (phase 2): corridor-march before frontier BFS.
 SCOUT_EXPLORE_SCROLL_MARGIN = _env_int("CRAWL_SCOUT_EXPLORE_SCROLL_MARGIN", 6)
@@ -720,6 +724,18 @@ def crystal_energy_at(col, row, obs):
     return None
 
 
+def factory_north_blocked(col, row, occupied_by_me, planned_targets):
+    """True if stepping north would enter a friendly unit (e.g. scout on spawn tile)."""
+    north_key = f"{col},{row + 1}"
+    return north_key in occupied_by_me or north_key in planned_targets
+
+
+def factory_may_go_north(col, row, can_go, occupied_by_me, planned_targets):
+    return can_go.get("NORTH") and not factory_north_blocked(
+        col, row, occupied_by_me, planned_targets
+    )
+
+
 def factory_spawn_is_safe(
     col, row, obs, config, occupied_by_me, planned_targets, my_robots
 ):
@@ -774,12 +790,16 @@ def factory_jump_north_is_safe(
     return True
 
 
-def factory_local_north_escape(col, row, can_go, obs, config, planned_targets, max_depth=6):
+def factory_local_north_escape(
+    col, row, can_go, obs, config, planned_targets, occupied_by_me, max_depth=6
+):
     """Weighted search for a cheap path to a cell with a known-open north edge."""
     if wall_value(col, row, obs, config) in (None, -1):
         return None
     if can_move_known(col, row, "NORTH", obs, config):
-        return "NORTH" if can_go.get("NORTH") else None
+        if factory_may_go_north(col, row, can_go, occupied_by_me, planned_targets):
+            return "NORTH"
+        return None
 
     max_cost = min(
         FACTORY_ESCAPE_MAX_COST,
@@ -840,7 +860,7 @@ def choose_factory_blocked_move(
     critical_scroll = scroll_margin <= SCROLL_CRITICAL_MARGIN
 
     escape = factory_local_north_escape(
-        col, row, can_go, obs, config, planned_targets
+        col, row, can_go, obs, config, planned_targets, occupied_by_me
     )
     row_stuck = factory_last_row == row and factory_prev_col == col
     horiz_stuck = row_stuck and factory_last_horiz in ("EAST", "WEST")
@@ -867,7 +887,7 @@ def choose_factory_blocked_move(
     ):
         return "JUMP_NORTH"
 
-    if can_go.get("NORTH") and panic:
+    if panic and factory_may_go_north(col, row, can_go, occupied_by_me, planned_targets):
         return "NORTH"
 
     if not critical_scroll:
@@ -982,6 +1002,65 @@ def count_enemy_mines(obs):
     return sum(1 for _, mine in obs.mines.items() if mine[2] != obs.player)
 
 
+def count_visible_enemy_units(obs, rtype):
+    return sum(
+        1 for _, data in obs.robots.items() if data[4] != obs.player and data[0] == rtype
+    )
+
+
+def enemy_miner_rush_active(obs, enemy_count):
+    """Opponent has fielded a miner (memory or vision) — match top-agent miner rush."""
+    if enemy_count.get(3, 0) >= 1:
+        return True
+    return count_visible_enemy_units(obs, 3) >= 1
+
+
+def all_mining_node_keys(obs, remembered_nodes):
+    return set(obs.miningNodes.keys()) | set(remembered_nodes)
+
+
+def miner_opener_spawn_has_node(factory_col, factory_row, nodes):
+    return f"{factory_col},{factory_row + 1}" in nodes
+
+
+def miner_opener_node_two_ahead(factory_col, factory_row, nodes):
+    """Node on the tile the spawn cell reaches after one factory NORTH."""
+    return f"{factory_col},{factory_row + 2}" in nodes
+
+
+def miner_opener_ready(factory_col, factory_row, obs, config, remembered_nodes):
+    """BUILD_MINER first when the spawn cell (or reachable tile) is a mining node."""
+    if not can_move_known(factory_col, factory_row, "NORTH", obs, config):
+        return False
+    nodes = all_mining_node_keys(obs, remembered_nodes)
+    if miner_opener_spawn_has_node(factory_col, factory_row, nodes):
+        return True
+    if miner_opener_node_two_ahead(factory_col, factory_row, nodes):
+        return True
+    distances = bfs_distances(factory_col, factory_row, obs, config)
+    for key in nodes:
+        ncol, nrow = parse_pos_key(key)
+        if nrow < factory_row:
+            continue
+        if distances.get((ncol, nrow)) is None:
+            continue
+        if distances[(ncol, nrow)] > MINER_OPENER_MAX_HOPS:
+            continue
+        if nrow == factory_row + 1 and ncol == factory_col:
+            return True
+    return False
+
+
+def miner_opener_needs_approach_north(
+    factory_col, factory_row, obs, config, remembered_nodes
+):
+    """Step north once so the next spawn cell sits on a node (e.g. node at row+2)."""
+    if miner_opener_ready(factory_col, factory_row, obs, config, remembered_nodes):
+        return False
+    nodes = all_mining_node_keys(obs, remembered_nodes)
+    return miner_opener_node_two_ahead(factory_col, factory_row, nodes)
+
+
 def choose_factory_build(
     energy,
     config,
@@ -1000,13 +1079,33 @@ def choose_factory_build(
     workers = counts[2]
     miners = counts[3]
     step = obs.step
+    miner_rush = enemy_miner_rush_active(obs, enemy_count)
+
+    # Miner-first opening when spawn (or one NORTH ahead) is on a visible/remembered node.
+    if (
+        scouts == 0
+        and miners == 0
+        and step <= MINER_OPENER_STEP
+        and energy >= config.minerCost
+        and miner_opener_ready(
+            factory_col, factory_row, obs, config, remembered_nodes
+        )
+    ):
+        return "BUILD_MINER"
 
     if scouts == 0 and energy >= config.scoutCost:
         if can_move_known(factory_col, factory_row, "NORTH", obs, config):
             return "BUILD_SCOUT"
 
-    # One scout for vision, then prioritize worker before more scouts or miners.
+    # One scout, then worker — unless the opponent already has a miner on the field.
     if scouts >= 1 and workers == 0:
+        if (
+            miners == 0
+            and miner_rush
+            and energy >= config.minerCost
+            and (remembered_nodes or step <= MINER_RUSH_STEP)
+        ):
+            return "BUILD_MINER"
         if energy >= config.workerCost:
             return "BUILD_WORKER"
         return None
@@ -1036,17 +1135,28 @@ def choose_factory_build(
         return s
 
     def miner_score():
-        if not remembered_nodes:
-            return -1
+        if not remembered_nodes and not miner_rush:
+            if not miner_opener_ready(
+                factory_col, factory_row, obs, config, remembered_nodes
+            ):
+                return -1
         s = MINER_BASE_SCORE
         if enemy_mines >= 1:
             s -= MINER_ENEMY_MINE_PENALTY
         if enemy_count[2] >= 1:
             s += MINER_ENEMY_WORKER_BONUS
+        if miner_rush:
+            s += MINER_ENEMY_MINER_BONUS
+        if miner_opener_ready(
+            factory_col, factory_row, obs, config, remembered_nodes
+        ):
+            s += MINER_FIRST_BONUS + MINER_ENEMY_MINER_BONUS
         if miners == 0:
             s += MINER_FIRST_BONUS
         if miners == 0 and step >= MINER_LATE_FIRST_STEP:
             s += MINER_LATE_FIRST_BONUS
+        if miners == 0 and miner_rush and step <= MINER_RUSH_STEP:
+            s += MINER_ENEMY_MINER_BONUS // 2
         return s
 
     candidates = []
@@ -1054,10 +1164,17 @@ def choose_factory_build(
         candidates.append(("BUILD_SCOUT", scout_score()))
     if energy >= config.workerCost and workers < WORKER_CAP:
         candidates.append(("BUILD_WORKER", worker_score()))
-    if energy >= config.minerCost and miners < MINER_CAP and remembered_nodes:
-        ms = miner_score()
-        if ms >= 0:
-            candidates.append(("BUILD_MINER", ms))
+    if energy >= config.minerCost and miners < MINER_CAP:
+        if (
+            remembered_nodes
+            or miner_rush
+            or miner_opener_ready(
+                factory_col, factory_row, obs, config, remembered_nodes
+            )
+        ):
+            ms = miner_score()
+            if ms >= 0:
+                candidates.append(("BUILD_MINER", ms))
 
     if not candidates:
         return None
@@ -1833,17 +1950,33 @@ def agent(obs, config):
                 and scroll_margin > 2
                 and not urgent_scroll
             )
+            miner_rush = enemy_miner_rush_active(obs, enemy_count)
+            opener_north = miner_opener_needs_approach_north(
+                col, row, obs, config, remembered_mining_nodes
+            )
             must_build = can_build and (
-                robot_counts[1] == 0
+                (
+                    robot_counts[1] == 0
+                    and robot_counts[3] == 0
+                    and build_action in ("BUILD_SCOUT", "BUILD_MINER")
+                )
                 or (
                     robot_counts[2] == 0
                     and robot_counts[1] >= 1
                     and obs.step >= WORKER_FIRST_STEP
+                    and not (
+                        robot_counts[3] == 0
+                        and miner_rush
+                        and obs.step <= MINER_RUSH_STEP
+                    )
                 )
                 or (
                     robot_counts[3] == 0
                     and robot_counts[1] >= 1
-                    and remembered_mining_nodes
+                    and (
+                        remembered_mining_nodes
+                        or (miner_rush and obs.step <= MINER_RUSH_STEP)
+                    )
                 )
             )
             lane_direction = None
@@ -1884,15 +2017,34 @@ def agent(obs, config):
                 can_go,
             ):
                 actions[uid] = "JUMP_NORTH"
-            elif urgent_scroll and can_go["NORTH"]:
+            elif urgent_scroll and factory_may_go_north(
+                col, row, can_go, occupied_by_me, planned_targets
+            ):
+                actions[uid] = "NORTH"
+            elif (
+                opener_north
+                and factory_may_go_north(
+                    col, row, can_go, occupied_by_me, planned_targets
+                )
+            ):
                 actions[uid] = "NORTH"
             elif must_build:
                 actions[uid] = build_action
             elif can_build and needs_worker:
                 actions[uid] = build_action
             elif (
+                can_build
+                and robot_counts[3] == 0
+                and robot_counts[1] >= 1
+                and miner_rush
+                and build_action == "BUILD_MINER"
+            ):
+                actions[uid] = build_action
+            elif (
                 needs_worker
-                and not can_go["NORTH"]
+                and not factory_may_go_north(
+                    col, row, can_go, occupied_by_me, planned_targets
+                )
                 and jump_cd == 0
                 and factory_jump_north_is_safe(
                     col,
@@ -1906,7 +2058,9 @@ def agent(obs, config):
                 )
             ):
                 actions[uid] = "JUMP_NORTH"
-            elif can_go["NORTH"]:
+            elif factory_may_go_north(
+                col, row, can_go, occupied_by_me, planned_targets
+            ):
                 actions[uid] = "NORTH"
             elif can_build:
                 actions[uid] = build_action

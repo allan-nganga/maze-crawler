@@ -19,7 +19,7 @@ State resets when `obs.step` does not increase (a new game).
 
 - **Walls:** `obs.walls` index is `(row - southBound) * width + col`. Bits N=1, E=2, S=4, W=8.
 - **Known-wall weighted search:** `spatial_step_cost` / `weighted_search_first_step` share the `CRAWL_*_EDGE` tunables on discovered cells (`obs.walls != -1`). Used for factory north-escape (`CRAWL_FACTORY_ESCAPE_MAX_COST`), scout frontier reach (`CRAWL_FRONTIER_MAX_COST`, north-biased, no south), and as a fallback in `step_toward` before unweighted BFS.
-- **Weighted pathing (Dijkstra):** goal-directed moves (`step_toward`, crystal assignment distances, refuel `move_toward_goal`) use full Dijkstra with collision/scroll/crush costs. Order: Dijkstra → weighted known-map goal search (`CRAWL_WEIGHTED_TARGET_MAX_COST`) → hop-count BFS → greedy axis moves.
+- **Weighted pathing (Dijkstra):** goal-directed moves use full Dijkstra with collision/scroll/crush costs. Default edge weights match **v21** (`CRAWL_NORTH_EDGE=2`, `CRAWL_HORIZ_EDGE=0`, south `PATH_BASE+SOUTH_EXTRA`); set `CRAWL_NORTH_EDGE=1` and `CRAWL_HORIZ_EDGE=2` to re-enable north bias. Fallback order: Dijkstra → weighted known-map search → hop-count BFS → greedy axis.
 - **Scroll projection:** future `southBound` is projected from `scrollCounter` and config intervals to avoid actions that leave the factory too close to the rising floor.
 - **Collision planning:** Mobile units are decided before the factory. Each unit records its destination in `planned_targets` so later units avoid friendly pile-ups on the same cell this turn.
 - **Crystal assignment:** Mobile units are matched to crystal goals globally each turn using Dijkstra edge-count distances on the known map + an optimal assignment pass (Hungarian maximize), then fallback local scoring handles leftovers.
@@ -49,7 +49,8 @@ The factory does not hunt crystals or refuel.
 
 **Build order** when spawn is safe, build cooldown is ready, scroll margin is greater than 2, and before step 380:
 
-- Always build at least one scout for vision.
+- **Miner opener** (before step `CRAWL_MINER_OPENER_STEP`, default 25): if the spawn cell `(col, row+1)` or the tile one step north of that is a mining node (visible or remembered, within `CRAWL_MINER_OPENER_DIST` BFS hops), **`BUILD_MINER`** before the first scout; if the node is only at `row+2`, the factory takes one **`NORTH`** first (`miner_opener_needs_approach_north`).
+- Otherwise build at least one scout for vision.
 - After the first scout exists and **no worker** is on the map, the factory **only** attempts `BUILD_WORKER` (no second scout until a worker exists).
 - Among affordable builds (scout up to 4 total, up to 2 workers, up to 2 miners when nodes are remembered), pick the action with the highest **score** from enemy-informed heuristics:
   - **Scouts:** boosted early and when no mining nodes are remembered yet; extra boost if many enemy scouts were seen.
@@ -64,7 +65,8 @@ The factory does not hunt crystals or refuel.
 - When **north is blocked**: try a **weighted north-escape** (N/E/W only, scroll-safe rows, prefers fewer/cheaper horizontal steps) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
 - Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`). Lane BFS scores get a **scout corridor bonus**: each turn scouts with `north_run_length ≥ 3` on known tiles update `scout_corridors`; factory lane scoring adds `run × 8` plus north progress, and an extra boost for `scout_next_lane_col` (lookahead corridor ahead of the factory).
 
-**Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open → **`NORTH`** (step onto crystals, avoid spawning into allies).
+**Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. **`NORTH`** is blocked when `(col, row+1)` is occupied by any friendly unit (factory must not crush a scout on the spawn tile). Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open and spawn clear → **`NORTH`**.
+**Miner rush:** If an enemy **miner** is visible or remembered, the factory may **`BUILD_MINER`** before the first worker (while `step ≤ CRAWL_MINER_RUSH_STEP`, default 80), with extra miner score (`CRAWL_MINER_ENEMY_MINER_BONUS`) so top-agent miner openings are answered.
 
 **Build tunables (env-driven):** `choose_factory_build` reads its scoring constants from environment variables so they can be swept without editing source:
 
