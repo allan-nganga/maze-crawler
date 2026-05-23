@@ -51,21 +51,25 @@ The factory does not hunt crystals or refuel.
 
 - **Miner opener** (before step `CRAWL_MINER_OPENER_STEP`, default 25): if the spawn cell `(col, row+1)` or the tile one step north of that is a mining node (visible or remembered, within `CRAWL_MINER_OPENER_DIST` BFS hops), **`BUILD_MINER`** before the first scout; if the node is only at `row+2`, the factory takes one **`NORTH`** first (`miner_opener_needs_approach_north`).
 - Otherwise build at least one scout for vision.
+- If **all scouts are dead** and there is still **no worker** after `CRAWL_WORKER_FIRST_STEP`, build the worker before rebuilding scouts.
 - After the first scout exists and **no worker** is on the map, the factory **only** attempts `BUILD_WORKER` (no second scout until a worker exists).
 - Among affordable builds (scout up to 4 total, up to 2 workers, up to 2 miners when nodes are remembered), pick the action with the highest **score** from enemy-informed heuristics:
   - **Scouts:** boosted early and when no mining nodes are remembered yet; extra boost if many enemy scouts were seen.
-  - **Workers:** boosted when the enemy has two or more scouts (crush), when we have no worker after step 25, or when an enemy worker is known.
-  - **Miners:** only if remembered mining nodes exist; boosted for first miner and when an enemy worker is known; slightly penalized if enemy mines are already on the map.
+  - **Workers:** boosted when the enemy has two or more scouts (crush), when we have no worker after `CRAWL_WORKER_FIRST_STEP` (default 12), or when an enemy worker is known.
+  - **Miners:** when remembered nodes exist, enemy miner rush, miner opener, or **proactive first miner** after a worker exists (`step ≥ CRAWL_MINER_PROACTIVE_STEP`, default 28) / late fallback (`CRAWL_MINER_LATE_FIRST_STEP`, default 35). Hard `BUILD_MINER` in the build ladder; `must_build` / `needs_miner` override movement. Extra score from `CRAWL_MINER_LATE_FIRST_BONUS` (default 6). Slightly penalized if enemy mines are already on the map.
 - After step **380**, the factory stops building to preserve energy for tiebreaks.
 
 **Movement:**
 
 - If projected scroll danger is high in the next few turns, force north movement instead of economy actions.
+- `SCROLL_CRITICAL_MARGIN` is env-driven via `CRAWL_SCROLL_CRITICAL_MARGIN` (default **5**) to trigger earlier `JUMP_NORTH` / panic escapes on low-spawn maps.
 - When **north is open**, always **`NORTH`** first (collects crystals on the north cell; does not build or lane-shift while north is passable).
 - When **north is blocked**: try a **weighted north-escape** (N/E/W only, scroll-safe rows, prefers fewer/cheaper horizontal steps) toward a known cell with an open north edge; then gated **`JUMP_NORTH`**; then **lane shift** (only while north blocked); then deterministic **E/W** sidestep. Sidestep oscillation at the same column prefers escape before more wiggling.
 - Lane column commitment and hysteresis unchanged (`LANE_SWITCH_MARGIN` default `8`). Lane BFS scores get a **scout corridor bonus**: each turn scouts with `north_run_length ≥ 3` on known tiles update `scout_corridors`; factory lane scoring adds `run × 8` plus north progress, and an extra boost for `scout_next_lane_col` (lookahead corridor ahead of the factory).
 
-**Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. **`NORTH`** is blocked when `(col, row+1)` is occupied by any friendly unit (factory must not crush a scout on the spawn tile). Critical builds (first scout / first worker after step 25 / first miner when nodes known) can fire even when north is open; otherwise north open and spawn clear → **`NORTH`**.
+**Spawn wait:** If a worker/miner build is due but spawn is blocked, the factory **`IDLE`**s or **`JUMP_NORTH`**s (when safe) instead of walking north onto the spawn tile.
+
+**Spawn safety:** `BUILD_*` only if **the wall between factory and spawn cell is passable** (no wall blocks NORTH; previously omitted, causing builds to silently fail when north was walled), spawn cell is known, empty, not reserved in `planned_targets`, no crystal on spawn (≥5 energy), and no friendly standing on the spawn cell. **`NORTH`** is blocked when `(col, row+1)` is occupied by any friendly unit (factory must not crush a scout on the spawn tile). Critical builds (first scout / first worker after `CRAWL_WORKER_FIRST_STEP` / first miner when nodes known) can fire even when north is open; otherwise north open and spawn clear → **`NORTH`**.
 **Miner rush:** If an enemy **miner** is visible or remembered, the factory may **`BUILD_MINER`** before the first worker (while `step ≤ CRAWL_MINER_RUSH_STEP`, default 80), with extra miner score (`CRAWL_MINER_ENEMY_MINER_BONUS`) so top-agent miner openings are answered.
 
 **Build tunables (env-driven):** `choose_factory_build` reads its scoring constants from environment variables so they can be swept without editing source:
@@ -74,6 +78,9 @@ The factory does not hunt crystals or refuel.
 - `CRAWL_SCOUT_BASE`, `CRAWL_SCOUT_FEWER_THAN_TWO_BONUS`, `CRAWL_SCOUT_EARLY_BONUS`, `CRAWL_SCOUT_EARLY_STEP`, `CRAWL_SCOUT_ENEMY_PRESSURE_BONUS`, `CRAWL_SCOUT_NO_WORKER_PENALTY`
 - `CRAWL_WORKER_BASE`, `CRAWL_WORKER_FIRST_STEP`, `CRAWL_WORKER_FIRST_BONUS`, `CRAWL_WORKER_ENEMY_SCOUT_BONUS`, `CRAWL_WORKER_ENEMY_WORKER_BONUS`, `CRAWL_WORKER_NO_WORKER_BONUS`
 - `CRAWL_MINER_BASE`, `CRAWL_MINER_ENEMY_MINE_PENALTY`, `CRAWL_MINER_ENEMY_WORKER_BONUS`, `CRAWL_MINER_FIRST_BONUS`, `CRAWL_MINER_LATE_FIRST_STEP`, `CRAWL_MINER_LATE_FIRST_BONUS`
+- `CRAWL_WORKER_TRANSFER_ENERGY` (default 90 — return path and `TRANSFER_*` threshold)
+- `CRAWL_MINER_PROACTIVE_STEP` (default 28 — first miner after worker exists)
+- `CRAWL_SCROLL_CRITICAL_MARGIN` (default 5 — earlier survival panic / jump behavior)
 
 `experiment_build_order.py` provides preset sweeps and a `--custom` mode; defaults match v18 behavior.
 
@@ -98,9 +105,9 @@ The factory does not hunt crystals or refuel.
 
 ## Worker (type 2)
 
-**Energy delivery:** If energy is at least 120 and the factory is adjacent with a clear transfer direction, `TRANSFER_*` all energy to the factory.
+**Energy delivery:** If energy is at least `CRAWL_WORKER_TRANSFER_ENERGY` (default **90**) and the factory is adjacent with a clear transfer direction, `TRANSFER_*` all energy to the factory.
 
-**Return-to-factory loop:** If energy reaches at least 120 and the factory is **not** adjacent, the worker actively paths back to the factory (`worker_return_to_factory_action` → `move_toward_goal`). Previously, full workers just kept walking north and never delivered unless they accidentally bumped into the factory.
+**Return-to-factory loop:** If energy reaches at least `CRAWL_WORKER_TRANSFER_ENERGY` (default **90**) and the factory is **not** adjacent, the worker paths back to the factory (`worker_return_to_factory_action` → `move_toward_goal`). Adjacent workers `TRANSFER_*` at the same threshold.
 
 **Refuel and crystals:** Same scoring and mine rules as scouts when hungry or when a crystal is worth a short detour.
 
